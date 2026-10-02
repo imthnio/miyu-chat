@@ -1,0 +1,74 @@
+# 发布：推送 v 开头的标签（例如 v1.0.0）时自动编译、生成校验文件、上传到 GitHub Release，
+# 并把同样的文件放到 dist 分支，给 jsDelivr 备用下载地址用（安装脚本连不上 GitHub 时会用它）。
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: 编译 amd64 / arm64 静态程序
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=$TAG" -o "dist/miyu-chat-linux-$arch" .
+          done
+          ./dist/miyu-chat-linux-amd64 -version
+
+      - name: 生成 SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum miyu-chat-linux-amd64 miyu-chat-linux-arm64 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: 上传到 GitHub Release
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/miyu-chat-linux-amd64 dist/miyu-chat-linux-arm64 dist/SHA256SUMS --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" dist/miyu-chat-linux-amd64 dist/miyu-chat-linux-arm64 dist/SHA256SUMS \
+              --repo "$REPO" --title "$TAG" --generate-notes
+          fi
+
+      # dist 分支由机器人专门管理，每次发布都整个替换（强制推送只针对这个分支）
+      - name: 更新 dist 分支（jsDelivr 备用下载）
+        run: |
+          mkdir /tmp/dist-branch
+          cp dist/miyu-chat-linux-amd64 dist/miyu-chat-linux-arm64 dist/SHA256SUMS /tmp/dist-branch/
+          echo "$TAG" > /tmp/dist-branch/VERSION
+          cd /tmp/dist-branch
+          git init -q -b dist
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "dist: $TAG"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" dist:dist
+
+      - name: 刷新 jsDelivr 缓存
+        continue-on-error: true
+        run: |
+          for f in miyu-chat-linux-amd64 miyu-chat-linux-arm64 SHA256SUMS VERSION; do
+            curl -fsS --max-time 30 "https://purge.jsdelivr.net/gh/${REPO}@dist/$f" || true
+            echo
+          done

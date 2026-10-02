@@ -1,0 +1,41 @@
+# 持续集成：每次推送代码或提交 PR 时自动检查，保证代码能编译、脚本没有语法问题
+name: CI
+
+on:
+  push:
+    branches-ignore: [dist]   # dist 分支只放发布好的程序，不用检查
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: 代码格式（gofmt）
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; echo "请先运行 gofmt -w ."; exit 1; }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build（静态编译）
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=ci" -o /tmp/miyu-chat .
+          /tmp/miyu-chat -version
+
+      - name: 前端脚本语法
+        run: node --check web/app.js
+
+      - name: 安装脚本检查（shellcheck + sh -n）
+        run: |
+          shellcheck --version
+          shellcheck -s sh install.sh
+          dash -n install.sh
+          bash -n install.sh
