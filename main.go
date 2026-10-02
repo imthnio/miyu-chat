@@ -9,6 +9,9 @@
 //	指令签名：登录后浏览器发的每条指令（发消息、双删、删好友……）都用私钥签名，签名里带着这次连接的随机数。
 //	          就算 Cloudflare 到服务器这一段是明文、被人偷看或篡改，也没法替你伪造“删除”“清空”之类的操作。
 //	序号（seq）：每条指令带一个只增不减的编号。服务器记住上一个编号，旧编号再发一次（重放）会被拒绝。
+//	邀请码：设置了 MIYU_INVITE_CODE 后，新身份第一次登录必须填对邀请码；已经注册过的身份不受影响。
+//	          用来防止陌生人随便注册、把小鸡的硬盘塞满。
+//	上限：MIYU_MAX_USERS 限制最多多少个身份，MIYU_MAX_DB_MB 限制数据库最多占多少 MB，满了就不再收新用户/新消息。
 //	ID / 公钥：由私钥算出来，可以公开，发给朋友加好友用。
 //	双删：任意一方删除消息，服务器会把密文彻底删掉，并通知双方浏览器立刻清掉这条消息。
 //	WebSocket：浏览器和服务器之间一直保持的连接，新消息能马上推过来，不用一直刷新页面。
@@ -20,6 +23,8 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"embed"
 	"encoding/base64"
@@ -30,6 +35,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,6 +58,16 @@ const (
 	maxConnsPerID = 20
 	authTimeout   = 15 * time.Second // 连上后这么久还没登录就断开
 	idleTimeout   = 90 * time.Second // 登录后这么久没任何动静就断开
+	// 每个人最多同时挂着这么多条“对方还没处理”的好友申请，防止一个人对全站乱发申请
+	maxPendingReqs = 50
+)
+
+// 防止硬盘被塞满的几个开关（启动时从参数/环境变量读取，0 或空表示不限制）
+var (
+	inviteCode string     // 邀请码：新身份第一次登录必须带上
+	maxUsers   int64      // 最多多少个身份
+	maxDBBytes int64      // 数据库最多多少字节（由 MB 换算）
+	regMu      sync.Mutex // 注册新用户时加锁，免得同时注册的人一起挤过用户数上限
 )
 
 var connCount atomic.Int64
@@ -86,6 +102,61 @@ func openDB(path string) {
 			log.Fatal(err)
 		}
 	}
+}
+
+// dbUsedBytes 算出数据库实际用了多少空间：总页数减去空闲页数，再乘每页大小。
+// 这几个查询只读文件头，很便宜，所以每次发消息都可以查一次。
+// 删掉的消息会变成空闲页，所以双删之后这里会变小，又能发新消息了。
+func dbUsedBytes() int64 {
+	var pages, free, size int64
+	db.QueryRow(`PRAGMA page_count`).Scan(&pages)
+	db.QueryRow(`PRAGMA freelist_count`).Scan(&free)
+	db.QueryRow(`PRAGMA page_size`).Scan(&size)
+	return (pages - free) * size
+}
+
+// dbFull 判断数据库是不是已经达到 MIYU_MAX_DB_MB 的上限（没设置上限就永远不满）
+func dbFull() bool { return maxDBBytes > 0 && dbUsedBytes() >= maxDBBytes }
+
+// inviteOK 检查邀请码。先各自算 SHA-256 再用“固定耗时比较”，别人没法靠测量响应快慢一位一位地猜出邀请码
+func inviteOK(got string) bool {
+	a := sha256.Sum256([]byte(strings.TrimSpace(got)))
+	b := sha256.Sum256([]byte(inviteCode))
+	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
+}
+
+// saveLogin 登录成功后保存/更新用户信息。
+// 如果是第一次出现的新身份，先依次检查：邀请码、用户数上限、存储空间。不通过就返回错误码和中文提示。
+func saveLogin(m *inMsg) (code, msg string) {
+	regMu.Lock()
+	defer regMu.Unlock()
+	var exists int
+	if db.QueryRow(`SELECT COUNT(*) FROM users WHERE pub=?`, m.Pub).Scan(&exists) != nil {
+		return "server", "服务器错误，请稍后再试"
+	}
+	if exists == 0 {
+		if inviteCode != "" && !inviteOK(m.Invite) {
+			return "need_invite", "这个服务器需要邀请码才能注册新身份：请在登录页的“邀请码”里填上管理员给你的邀请码，再点登录"
+		}
+		if maxUsers > 0 {
+			var n int64
+			db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
+			if n >= maxUsers {
+				return "users_full", "这个服务器的用户数已满，不能再注册新身份了（已有的身份不受影响）。请联系服务器管理员"
+			}
+		}
+		if dbFull() {
+			return "reg_storage_full", "服务器存储已满，暂时不能注册新身份。请联系服务器管理员"
+		}
+	}
+	t := now()
+	_, err := db.Exec(`INSERT INTO users(pub,box,boxsig,name,created,seen) VALUES(?,?,?,?,?,?)
+		ON CONFLICT(pub) DO UPDATE SET box=excluded.box, boxsig=excluded.boxsig, seen=excluded.seen`,
+		m.Pub, m.Box, m.BoxSig, "", t, t)
+	if err != nil {
+		return "server", "服务器错误，请稍后再试"
+	}
+	return "", ""
 }
 
 func pair(x, y string) (string, string) {
@@ -338,6 +409,8 @@ type inMsg struct {
 	// 登录后的签名指令：Body 是指令本身的 JSON 文本，Sig 是对它的签名，Seq 是指令序号（在 Body 里面）
 	Body string `json:"body"`
 	Seq  int64  `json:"seq"`
+	// 邀请码：只有新身份第一次登录时才需要
+	Invite string `json:"invite"`
 }
 
 // openCmd 检查一条登录后的指令：必须是 {t:"cmd"}、签名对得上、序号比上一条大，然后拆出里面真正的指令。
@@ -481,12 +554,8 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 				c.fail("同一个身份打开的页面太多了，请关掉一些再试")
 				return
 			}
-			t := now()
-			_, err := db.Exec(`INSERT INTO users(pub,box,boxsig,name,created,seen) VALUES(?,?,?,?,?,?)
-				ON CONFLICT(pub) DO UPDATE SET box=excluded.box, boxsig=excluded.boxsig, seen=excluded.seen`,
-				m.Pub, m.Box, m.BoxSig, "", t, t)
-			if err != nil {
-				c.fail("服务器错误")
+			if code, msg := saveLogin(&m); code != "" {
+				c.reply(map[string]any{"t": "error", "code": code, "msg": msg})
 				return
 			}
 			c.pub = m.Pub
@@ -569,6 +638,13 @@ func (c *client) handle(m *inMsg) {
 			c.makeFriends(to)
 			return
 		}
+		// 待处理的申请太多就不让再发（重复给同一个人发不算新的）
+		var pending int
+		db.QueryRow(`SELECT COUNT(*) FROM requests WHERE from_pub=? AND to_pub<>?`, c.pub, to).Scan(&pending)
+		if pending >= maxPendingReqs {
+			c.fail("你发出的好友申请太多了（最多同时 " + strconv.Itoa(maxPendingReqs) + " 个等对方处理），请等对方通过或拒绝后再加新好友")
+			return
+		}
 		db.Exec(`INSERT OR IGNORE INTO requests(from_pub,to_pub,ts) VALUES(?,?,?)`, c.pub, to, now())
 		me, _ := getUser(c.pub)
 		h.push(to, map[string]any{"t": "request", "user": me})
@@ -639,6 +715,12 @@ func (c *client) handle(m *inMsg) {
 			c.fail("消息太长或格式错误")
 			return
 		}
+		// 数据库到上限了就不再收新消息（删除不受影响，删掉旧消息能腾出空间）
+		if dbFull() {
+			c.reply(map[string]any{"t": "error", "code": "storage_full",
+				"msg": "服务器存储已满，暂时不能发新消息。可以先双删一些旧聊天记录腾出空间，或者联系服务器管理员扩容"})
+			return
+		}
 		a, b := pair(c.pub, m.To)
 		t := now()
 		res, err := db.Exec(`INSERT INTO messages(pa,pb,from_pub,to_pub,nonce,ct,ts) VALUES(?,?,?,?,?,?,?)`, a, b, c.pub, m.To, m.Nonce, m.CT, t)
@@ -700,12 +782,20 @@ func main() {
 	addr := flag.String("listen", envOr("MIYU_LISTEN", ":8080"), "监听地址，例如 :8080")
 	dbPath := flag.String("db", envOr("MIYU_DB", "miyu.db"), "SQLite 数据库文件")
 	hostList := flag.String("host", envOr("MIYU_HOST", ""), "允许登录的网址（域名[:端口]），多个用逗号分隔，例如 chat.example.com；不填就用浏览器访问的网址")
+	invite := flag.String("invite", envOr("MIYU_INVITE_CODE", ""), "邀请码：新身份第一次登录必须填对（不填就不需要）。命令行参数别人用 ps 能看到，建议用环境变量 MIYU_INVITE_CODE")
+	users := flag.Int64("max-users", envInt("MIYU_MAX_USERS"), "最多允许多少个身份，0 表示不限制")
+	dbMB := flag.Int64("max-db-mb", envInt("MIYU_MAX_DB_MB"), "数据库最多占多少 MB，满了不再收新消息，0 表示不限制")
 	showVer := flag.Bool("version", false, "显示版本号后退出")
 	flag.Parse()
 	if *showVer {
 		println("miyu-chat " + version)
 		return
 	}
+	inviteCode = strings.TrimSpace(*invite)
+	if *users < 0 || *dbMB < 0 {
+		log.Fatal("-max-users / -max-db-mb 不能是负数，0 表示不限制")
+	}
+	maxUsers, maxDBBytes = *users, *dbMB*1024*1024
 	allowedHosts = parseHosts(*hostList)
 	if len(allowedHosts) == 0 {
 		log.Printf("提示：没有设置 MIYU_HOST，登录时以浏览器访问的网址为准。建议设置成你的聊天域名（例如 MIYU_HOST=chat.example.com），防止别的网站转发登录")
@@ -723,6 +813,12 @@ func main() {
 	mux.Handle("/", securityHeaders(files))
 
 	log.Printf("miyu-chat %s 启动，监听 %s，数据库 %s", version, *addr, *dbPath)
+	inviteState := "未开启（谁都能注册新身份）"
+	if inviteCode != "" {
+		inviteState = "已开启"
+	}
+	log.Printf("限制：邀请码 %s，用户数上限 %s，数据库上限 %s", inviteState, limitText(maxUsers, " 个"), limitText(*dbMB, " MB"))
+
 	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }
@@ -737,7 +833,29 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// limitText 把上限显示成人能看懂的文字：0 显示“不限制”
+func limitText(n int64, unit string) string {
+	if n == 0 {
+		return "不限制"
+	}
+	return strconv.FormatInt(n, 10) + unit
+}
+
+// envInt 读取一个整数环境变量；没设置就是 0（不限制），写错了直接报错退出，免得以为限制生效了其实没有
+func envInt(k string) int64 {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		log.Fatalf("环境变量 %s=%q 不是有效的非负整数，请改成数字（0 表示不限制）", k, v)
+	}
+	return n
+}
+
 func envOr(k, d string) string {
+
 	if v := os.Getenv(k); v != "" {
 		return v
 	}

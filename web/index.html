@@ -15,7 +15,10 @@
     <p class="muted">端到端加密聊天。没有账号密码，你的密钥就是你的身份。</p>
     <label for="keyInput">输入你的密钥（64 位）</label>
     <textarea id="keyInput" rows="3" placeholder="粘贴你的私钥" autocomplete="off" spellcheck="false"></textarea>
-    <label class="check"><input type="checkbox" id="remember"> 在这个浏览器上记住密钥（用本地密码加密保存，公共电脑别勾）</label>
+    <label for="inviteInput">邀请码（服务器要求时填写）</label>
+    <input id="inviteInput" placeholder="没有可以不填；已经注册过的身份不需要" autocomplete="off" spellcheck="false">
+    <label class="check"><input type="checkbox" id="remember">
+ 在这个浏览器上记住密钥（用本地密码加密保存，公共电脑别勾）</label>
     <!-- 勾选“记住密钥”后才显示：设置一个本地密码，私钥会用它加密后再存进浏览器 -->
     <input id="rememberPwd" class="hidden" type="password" placeholder="设置本地密码（至少 6 位，只用来在这个浏览器上解锁）" autocomplete="new-password">
     <p id="rememberHint" class="muted small hidden"></p>

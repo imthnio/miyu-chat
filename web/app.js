@@ -30,6 +30,7 @@
   let ws = null, wsOk = false, retry = 0;
   let stopped = false;    // 遇到“重连也没用”的错误（比如密钥校验失败）时设为 true，不再自动重连
   let sessionNonce = null, seq = 0; // 这次连接的随机数和指令序号，用来给每条指令签名
+  let invite = "";        // 登录页填的邀请码（只有新身份第一次登录时服务器才检查）
   let me = null;
   const friends = new Map();   // id -> {id,name,box,boxsig,online,verified,shared,unread}
   const requests = new Map();  // id -> user
@@ -134,8 +135,10 @@
       forgetKey();
     }
     $("rememberPwd").value = "";
+    invite = $("inviteInput").value.trim();
     start(seed);
   };
+  $("inviteInput").addEventListener("input", () => $("inviteInput").classList.remove("bad"));
 
   // ---------- 解锁页 ----------
   $("unlockBtn").onclick = async () => {
@@ -154,6 +157,7 @@
     } finally { $("unlockBtn").disabled = false; }
     $("unlockPwd").value = ""; $("unlockErr").textContent = "";
     $("remember").checked = true;
+    invite = "";
     start(seed);
   };
   $("unlockPwd").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("unlockBtn").click(); } });
@@ -223,7 +227,9 @@
 
         const boxHex = toHex(keys.box.publicKey);
         const boxsig = nacl.sign.detached(enc.encode("miyu-box:" + boxHex), keys.sign.secretKey);
-        ws.send(JSON.stringify({ t: "auth", pub: keys.id, box: boxHex, boxsig: toHex(boxsig), sig: toHex(sig) }));
+        const auth = { t: "auth", pub: keys.id, box: boxHex, boxsig: toHex(boxsig), sig: toHex(sig) };
+        if (invite) auth.invite = invite;
+        ws.send(JSON.stringify(auth));
         break;
       }
       case "ready":
@@ -289,7 +295,7 @@
   }
 
   // 这些错误码表示“登录不了”，自动重连只会一直失败，所以停下来回到登录页
-  const FATAL_CODES = new Set(["bad_auth"]);
+  const FATAL_CODES = new Set(["bad_auth", "need_invite", "users_full", "reg_storage_full"]);
   function backToLogin(msg, code) {
     stopped = true; pendingSave = null;
     if (ws) ws.close();
@@ -297,6 +303,10 @@
     $("app").classList.add("hidden");
     $("login").classList.remove("hidden");
     $("loginErr").textContent = msg || "登录失败，请重试";
+    // 从解锁页进来的，输入框是空的：把刚解开的私钥填回去，用户处理完（比如填邀请码）直接点登录就行
+    if (keys && !$("keyInput").value) $("keyInput").value = toHex(keys.seed);
+    if (code === "need_invite") { $("inviteInput").classList.add("bad"); $("inviteInput").focus(); }
+
   }
 
   // ---------- 侧边栏 ----------
