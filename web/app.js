@@ -219,12 +219,10 @@
         // 随机数必须是 64 位十六进制，奇怪的格式直接不理
         if (typeof m.nonce !== "string" || !/^[0-9a-f]{64}$/.test(m.nonce)) break;
         sessionNonce = m.nonce; seq = 0;
-
         // 用私钥对服务器给的随机数签名，证明我拥有这个 ID。
         // 签名里带上地址栏里的网址（location.host），这样别的网站就算转发了这串随机数，
         // 签出来的也是那个网站的网址，拿到真正的服务器上验证不通过，没法冒充我登录。
         const sig = nacl.sign.detached(enc.encode("miyu-login:v2:" + location.host + ":" + m.nonce), keys.sign.secretKey);
-
         const boxHex = toHex(keys.box.publicKey);
         const boxsig = nacl.sign.detached(enc.encode("miyu-box:" + boxHex), keys.sign.secretKey);
         const auth = { t: "auth", pub: keys.id, box: boxHex, boxsig: toHex(boxsig), sig: toHex(sig) };
@@ -306,11 +304,9 @@
     // 从解锁页进来的，输入框是空的：把刚解开的私钥填回去，用户处理完（比如填邀请码）直接点登录就行
     if (keys && !$("keyInput").value) $("keyInput").value = toHex(keys.seed);
     if (code === "need_invite") { $("inviteInput").classList.add("bad"); $("inviteInput").focus(); }
-
   }
 
   // ---------- 侧边栏 ----------
-
   $("saveName").onclick = () => send({ t: "setname", name: $("myName").value });
   $("copyId").onclick = () => copy(keys.id);
   $("addBtn").onclick = () => {
@@ -336,7 +332,6 @@
       const row = document.createElement("div"); row.className = "row";
       const ok = document.createElement("button"); ok.className = "small primary"; ok.textContent = "通过";
       ok.onclick = () => { accepted.add(u.id); send({ t: "friend_accept", from: u.id }); };
-
       const no = document.createElement("button"); no.className = "small"; no.textContent = "拒绝";
       no.onclick = () => send({ t: "friend_reject", from: u.id });
       row.append(ok, no); d.append(t, idl, row); rq.append(d);
@@ -502,12 +497,10 @@
     $("rememberHint").classList.remove("hidden");
   }
   $("remember").onchange(); // 浏览器刷新后可能还记着勾选状态，同步一下密码框显示
-
   // 保存过加密的私钥：显示解锁页
   if (localStorage.getItem(KEY_STORE_V2)) {
     $("login").classList.add("hidden"); $("unlock").classList.remove("hidden");
     if (!canRemember) $("unlockErr").textContent = "现在不是 https:// 网页，浏览器不允许解密。请用 https:// 地址打开，或者点“换一个密钥登录”。";
     else $("unlockPwd").focus();
   }
-
 })();

@@ -575,7 +575,6 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 		}
 		c.handle(cmd)
 	}
-
 }
 
 type friendView struct {
@@ -818,7 +817,6 @@ func main() {
 		inviteState = "已开启"
 	}
 	log.Printf("限制：邀请码 %s，用户数上限 %s，数据库上限 %s", inviteState, limitText(maxUsers, " 个"), limitText(*dbMB, " MB"))
-
 	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }
@@ -855,7 +853,6 @@ func envInt(k string) int64 {
 }
 
 func envOr(k, d string) string {
-
 	if v := os.Getenv(k); v != "" {
 		return v
 	}

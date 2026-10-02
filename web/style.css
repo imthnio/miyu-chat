@@ -11,15 +11,13 @@ button.small{padding:5px 10px;font-size:13px}
 input,textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid #2c3e50;border-radius:8px;padding:9px 10px;font:inherit;resize:none}
 input:focus,textarea:focus{outline:none;border-color:var(--accent)}
 input.bad{border-color:var(--danger)}
-
 code{font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all}
 .muted{color:var(--muted)}.small{font-size:12px}
 .err{color:var(--danger);min-height:1.2em}
 .warn{color:#f0b429;font-size:13px}
 .screen{height:100%}
-#login,#unlock{display:flex;align-items:center;justify-content:center;padding:16px}
-
-.card{width:100%;max-width:420px;background:var(--panel);border-radius:14px;padding:24px;display:flex;flex-direction:column;gap:10px}
+#login,#unlock{display:flex;padding:16px;overflow-y:auto}
+.card{margin:auto;width:100%;max-width:420px;background:var(--panel);border-radius:14px;padding:24px;display:flex;flex-direction:column;gap:10px}
 .card h1{margin:0}
 .check{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--muted)}
 .check input{width:auto}
