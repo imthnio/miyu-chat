@@ -159,10 +159,13 @@
         renderSide(); break;
       case "history": onHistory(m); break;
       case "msg": onMsg(m.msg); break;
-      case "deleted":
-        for (const c of chats.values()) c.msgs.delete(m.id);
-        const el = document.querySelector('[data-mid="' + m.id + '"]'); if (el) el.remove();
+      case "deleted": {
+        // id 一定当数字处理，避免拼进选择器时出错
+        const id = Number(m.id); if (!Number.isSafeInteger(id)) break;
+        for (const c of chats.values()) c.msgs.delete(id);
+        const el = document.querySelector('[data-mid="' + id + '"]'); if (el) el.remove();
         break;
+      }
       case "cleared": {
         const c = chats.get(m.with); if (c) { c.msgs.clear(); c.more = false; }
         if (active === m.with) renderMsgs();
