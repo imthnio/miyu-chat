@@ -199,19 +199,24 @@ func (h *hub) push(pub string, v any) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for c := range h.conns[pub] {
-		select {
-		case c.send <- b:
-		default: // 慢客户端直接丢弃，客户端重连后会重新拉取
-		}
+		c.enqueue(b)
+	}
+}
+
+// enqueue 把要发给浏览器的数据放进发送队列。
+// 队列满了说明对方网太慢或卡住了：直接断开这条连接，浏览器会自动重连并重新拉取，
+// 这样不会悄悄丢消息（以前是直接丢弃，但连接不断，浏览器就不知道要重新拉取）。
+func (c *client) enqueue(b []byte) {
+	select {
+	case c.send <- b:
+	default:
+		c.conn.Close()
 	}
 }
 
 func (c *client) reply(v any) {
 	b, _ := json.Marshal(v)
-	select {
-	case c.send <- b:
-	default:
-	}
+	c.enqueue(b)
 }
 
 func (c *client) fail(msg string) { c.reply(map[string]any{"t": "error", "msg": msg}) }
