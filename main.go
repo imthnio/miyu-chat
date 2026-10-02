@@ -29,6 +29,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
@@ -433,7 +434,13 @@ func (c *client) friendList() []friendView {
 func (c *client) handle(m *inMsg) {
 	switch m.T {
 	case "setname":
-		name := strings.TrimSpace(m.Name)
+		// 去掉看不见的控制字符/方向控制符（比如 U+202E 能把文字倒过来显示，用来冒充别人）
+		name := strings.TrimSpace(strings.Map(func(r rune) rune {
+			if unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r) {
+				return -1
+			}
+			return r
+		}, m.Name))
 		if utf8.RuneCountInString(name) > 24 {
 			c.fail("昵称最多 24 个字")
 			return
@@ -491,12 +498,15 @@ func (c *client) handle(m *inMsg) {
 
 	case "unfriend":
 		// 删除好友，并双删全部聊天记录
+		was := isFriend(c.pub, m.With)
 		a, b := pair(c.pub, m.With)
 		db.Exec(`DELETE FROM messages WHERE pa=? AND pb=?`, a, b)
 		db.Exec(`DELETE FROM friends WHERE (a=? AND b=?) OR (a=? AND b=?)`, c.pub, m.With, m.With, c.pub)
 		db.Exec(`DELETE FROM requests WHERE (from_pub=? AND to_pub=?) OR (from_pub=? AND to_pub=?)`, c.pub, m.With, m.With, c.pub)
 		h.push(c.pub, map[string]any{"t": "unfriended", "id": m.With})
-		h.push(m.With, map[string]any{"t": "unfriended", "id": c.pub})
+		if was { // 只通知真正的好友，防止给任意 ID 乱推通知
+			h.push(m.With, map[string]any{"t": "unfriended", "id": c.pub})
+		}
 
 	case "history":
 		if !isFriend(c.pub, m.With) {
@@ -567,7 +577,11 @@ func (c *client) handle(m *inMsg) {
 		h.push(to, ev)
 
 	case "clear":
-		// 双删整个会话
+		// 双删整个会话（只能删自己和好友之间的；不是好友就不推通知，防止骚扰任意 ID）
+		if !isFriend(c.pub, m.With) {
+			c.fail("对方不是你的好友")
+			return
+		}
 		a, b := pair(c.pub, m.With)
 		db.Exec(`DELETE FROM messages WHERE pa=? AND pb=?`, a, b)
 		h.push(c.pub, map[string]any{"t": "cleared", "with": m.With, "by": c.pub})
