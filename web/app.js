@@ -27,6 +27,10 @@
   const friends = new Map();   // id -> {id,name,box,boxsig,online,verified,shared,unread}
   const requests = new Map();  // id -> user
   const chats = new Map();     // id -> {msgs: Map(id->msg), loaded, more, oldest}
+  // 只接受“我自己同意过”的新好友：服务器推来的 friend_added 必须是我申请过的或我点了通过的 ID，
+  // 防止服务器（或中间人）偷偷塞一个陌生人进好友列表。
+  const pendingOut = new Set(); // 我发出过申请的 ID（自己输入的 + 登录时服务器列出的“已发出的申请”）
+  const accepted = new Set();   // 我点了“通过”的 ID
   let active = null;
 
   // ---------- 小工具 ----------
@@ -157,6 +161,7 @@
         friends.clear(); requests.clear();
         m.friends.forEach(prepFriend);
         m.requests.forEach((u) => requests.set(u.id, u));
+        (m.sent || []).forEach((id) => { if (typeof id === "string") pendingOut.add(id.toLowerCase()); });
         // 重连后清掉缓存重新拉，保证离线期间被双删的消息不会残留
         chats.clear();
         renderSide();
@@ -170,10 +175,18 @@
       case "req_sent": toast("好友申请已发送，等对方通过"); $("addInput").value = ""; break;
       case "request": requests.set(m.user.id, m.user); renderSide(); toast("收到新的好友申请"); break;
       case "request_gone": requests.delete(m.id); renderSide(); break;
-      case "friend_added":
-        requests.delete(m.user.id); prepFriend(m.user); renderSide();
+      case "friend_added": {
+        // 核对：这个 ID 必须是我申请过或我通过的，否则不认（登录时的好友列表另算，以服务器为准）
+        const id = m.user && typeof m.user.id === "string" ? m.user.id : "";
+        if (!/^[0-9a-f]{64}$/.test(id) || (!pendingOut.has(id) && !accepted.has(id))) {
+          console.warn("已忽略一个不是你申请或通过的好友：", id);
+          break;
+        }
+        pendingOut.delete(id); accepted.delete(id);
+        requests.delete(id); prepFriend(m.user); renderSide();
         toast("已添加好友 " + displayName(m.user)); $("addInput").value = "";
         break;
+      }
       case "friend_update": if (friends.has(m.user.id)) { prepFriend(m.user); renderSide(); if (active === m.user.id) renderHead(); } break;
       case "presence": { const f = friends.get(m.id); if (f) { f.online = m.online; renderSide(); } break; }
       case "unfriended":
@@ -216,6 +229,7 @@
   $("addBtn").onclick = () => {
     const id = $("addInput").value.trim().toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(id)) { toast("好友 ID 应该是 64 位十六进制"); return; }
+    pendingOut.add(id); // 记下来：之后只认这个 ID 成为好友
     send({ t: "friend_req", to: id });
   };
   $("addInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("addBtn").click(); });
@@ -234,7 +248,8 @@
       const idl = document.createElement("code"); idl.className = "muted small"; idl.textContent = u.id;
       const row = document.createElement("div"); row.className = "row";
       const ok = document.createElement("button"); ok.className = "small primary"; ok.textContent = "通过";
-      ok.onclick = () => send({ t: "friend_accept", from: u.id });
+      ok.onclick = () => { accepted.add(u.id); send({ t: "friend_accept", from: u.id }); };
+
       const no = document.createElement("button"); no.className = "small"; no.textContent = "拒绝";
       no.onclick = () => send({ t: "friend_reject", from: u.id });
       row.append(ok, no); d.append(t, idl, row); rq.append(d);
