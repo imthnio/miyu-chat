@@ -22,6 +22,7 @@
   let keys = null;        // {seed, sign, box, id}
   let ws = null, wsOk = false, retry = 0;
   let stopped = false;    // 遇到“重连也没用”的错误（比如密钥校验失败）时设为 true，不再自动重连
+  let sessionNonce = null, seq = 0; // 这次连接的随机数和指令序号，用来给每条指令签名
   let me = null;
   const friends = new Map();   // id -> {id,name,box,boxsig,online,verified,shared,unread}
   const requests = new Map();  // id -> user
@@ -109,11 +110,20 @@
     $("connState").className = "dot " + (ok ? "on" : "off");
     $("connText").textContent = text;
   }
-  function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); else toast("还没连上服务器，请稍等"); }
+  // 登录后的每条指令都签名：body 是指令（带递增的序号 seq）的 JSON 文本，
+  // 签名内容 = "miyu-cmd:v2:" + 这次连接的随机数 + ":" + body。
+  // 这样中间人既改不了指令内容，也没法把旧指令再发一遍。
+  function send(obj) {
+    if (!ws || ws.readyState !== 1 || !sessionNonce) { toast("还没连上服务器，请稍等"); return; }
+    const body = JSON.stringify(Object.assign({}, obj, { seq: ++seq }));
+    const sig = nacl.sign.detached(enc.encode("miyu-cmd:v2:" + sessionNonce + ":" + body), keys.sign.secretKey);
+    ws.send(JSON.stringify({ t: "cmd", body, sig: toHex(sig) }));
+  }
 
   function connect() {
     setConn(false, "连接中…");
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
+    sessionNonce = null; seq = 0;
     ws = new WebSocket(proto + location.host + "/ws");
     ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; } handle(m); };
     ws.onclose = () => {
@@ -127,6 +137,10 @@
   function handle(m) {
     switch (m.t) {
       case "challenge": {
+        // 随机数必须是 64 位十六进制，奇怪的格式直接不理
+        if (typeof m.nonce !== "string" || !/^[0-9a-f]{64}$/.test(m.nonce)) break;
+        sessionNonce = m.nonce; seq = 0;
+
         // 用私钥对服务器给的随机数签名，证明我拥有这个 ID。
         // 签名里带上地址栏里的网址（location.host），这样别的网站就算转发了这串随机数，
         // 签出来的也是那个网站的网址，拿到真正的服务器上验证不通过，没法冒充我登录。

@@ -6,6 +6,9 @@
 //	密钥登录：没有账号密码。每个人有一把私钥，服务器发一串随机数，浏览器用私钥签名，签名对了就算登录成功。
 //	域名绑定：登录签名里带上浏览器地址栏里的网址（域名[:端口]）。别的服务器就算把我们的随机数转给你签名，
 //	          签出来的也是“它自己的网址”，拿到我们这里验证不通过，没法冒充你登录。
+//	指令签名：登录后浏览器发的每条指令（发消息、双删、删好友……）都用私钥签名，签名里带着这次连接的随机数。
+//	          就算 Cloudflare 到服务器这一段是明文、被人偷看或篡改，也没法替你伪造“删除”“清空”之类的操作。
+//	序号（seq）：每条指令带一个只增不减的编号。服务器记住上一个编号，旧编号再发一次（重放）会被拒绝。
 //	ID / 公钥：由私钥算出来，可以公开，发给朋友加好友用。
 //	双删：任意一方删除消息，服务器会把密文彻底删掉，并通知双方浏览器立刻清掉这条消息。
 //	WebSocket：浏览器和服务器之间一直保持的连接，新消息能马上推过来，不用一直刷新页面。
@@ -172,6 +175,8 @@ type client struct {
 	conn *websocket.Conn
 	send chan []byte
 	pub  string
+	// 这条连接上一条指令的序号，下一条必须比它大（防止把截获的旧指令再发一遍）
+	lastSeq int64
 	// 简单限流
 	tokens float64
 	last   time.Time
@@ -330,6 +335,30 @@ type inMsg struct {
 	Nonce  string `json:"nonce"`
 	CT     string `json:"ct"`
 	CID    string `json:"cid"`
+	// 登录后的签名指令：Body 是指令本身的 JSON 文本，Sig 是对它的签名，Seq 是指令序号（在 Body 里面）
+	Body string `json:"body"`
+	Seq  int64  `json:"seq"`
+}
+
+// openCmd 检查一条登录后的指令：必须是 {t:"cmd"}、签名对得上、序号比上一条大，然后拆出里面真正的指令。
+// 签名内容是 "miyu-cmd:v2:" + 这次连接的随机数 + ":" + body，所以换一条连接拿去重放也没用。
+// 出错时返回错误码和给用户看的中文提示。
+func (c *client) openCmd(m *inMsg, nonce string) (*inMsg, string, string) {
+	if m.T != "cmd" {
+		return nil, "need_sign", "指令没有签名，已拒绝。请刷新网页换到最新版"
+	}
+	if !verify(c.pub, "miyu-cmd:v2:"+nonce+":"+m.Body, m.Sig) {
+		return nil, "bad_sig", "指令签名校验失败，已拒绝。请刷新网页后重试"
+	}
+	var cmd inMsg
+	if json.Unmarshal([]byte(m.Body), &cmd) != nil || cmd.T == "cmd" || cmd.T == "auth" {
+		return nil, "bad_cmd", "数据格式错误"
+	}
+	if cmd.Seq <= c.lastSeq {
+		return nil, "bad_seq", "指令序号不对（可能是被重放的旧指令），已拒绝。请刷新网页后重试"
+	}
+	c.lastSeq = cmd.Seq
+	return &cmd, "", ""
 }
 
 func serveWS(w http.ResponseWriter, r *http.Request) {
@@ -469,8 +498,15 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		c.handle(&m)
+		// 登录之后只接受签过名的指令，没签名、签名不对、序号重复的一律拒绝
+		cmd, code, msg := c.openCmd(&m, nonce)
+		if cmd == nil {
+			c.reply(map[string]any{"t": "error", "code": code, "msg": msg})
+			continue
+		}
+		c.handle(cmd)
 	}
+
 }
 
 type friendView struct {
