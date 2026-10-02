@@ -31,6 +31,11 @@
 #    systemd / OpenRC：系统的“服务管家”，负责开机自启、崩溃自动重启。
 #              Debian/Ubuntu 用 systemd，Alpine 用 OpenRC，脚本会自动判断。
 #    数据目录：聊天数据都存在 /var/lib/miyu-chat/miyu.db 这一个文件里。
+#    SHA256 校验值：文件的“指纹”。发布时会把官方程序的指纹写进 SHA256SUMS，
+#              脚本下载完先对指纹，一个字节不对都不会安装，防止下到损坏或被篡改的程序。
+#    jsDelivr：一个免费的 CDN 镜像站。国内机器连不上 GitHub 时，脚本自动改从这里下载。
+#    Cloudflare 小黄云：在 Cloudflare 里把域名的云朵点成橙色，访问会先经过 Cloudflare 再转到你的机器，
+#              能隐藏真实 IP、免费加 HTTPS。
 # =====================================================================
 
 # 出错就停，避免装到一半留下烂摊子
@@ -318,6 +323,8 @@ download_bin() {
 }
 
 # ---------- 创建运行用户和数据目录 ----------
+# 程序不用 root 跑，而是用一个专门的、不能登录的 miyu 用户，就算程序有漏洞也碰不到系统其它文件。
+# 数据目录权限设成 700：只有 miyu 用户自己能进。
 setup_user() {
 	if ! id "$RUN_USER" >/dev/null 2>&1; then
 		if [ "$OS" = "alpine" ]; then
@@ -430,6 +437,7 @@ load_conf() {
 }
 
 # ---------- 检查服务是否真的跑起来了 ----------
+# 最多等 10 秒，访问本机的 /healthz 地址，能返回 ok 才算启动成功；失败就告诉你去哪看日志
 health_check() {
 	i=0
 	while [ $i -lt 10 ]; do
@@ -442,6 +450,9 @@ health_check() {
 	exit 1
 }
 
+# ---------- 安装（默认动作） ----------
+# 顺序：检查 root → 认系统和架构 → 装 curl → 看是不是已经装过 → 认机器类型 → 问端口
+#       → 下载并校验程序 → 建用户 → 注册服务 → 防火墙 → 检查能不能访问
 do_install() {
 	need_root; detect_os; detect_arch; install_deps
 	if [ -f "$CONF" ]; then
@@ -468,6 +479,8 @@ do_install() {
 	trap - EXIT
 }
 
+# ---------- 更新 ----------
+# 只换程序文件然后重启服务；端口、配置、聊天数据都不动
 do_update() {
 	need_root; detect_os; detect_arch; install_deps
 	[ -f "$CONF" ] || die "还没有安装过，请先运行：sh install.sh"
@@ -478,6 +491,8 @@ do_update() {
 	info "更新完成，聊天数据没有动。"
 }
 
+# ---------- 查看状态 ----------
+# 显示端口、服务管家里的运行状态，再实际访问一下 /healthz 确认能用
 do_status() {
 	detect_os
 	if [ -f "$CONF" ]; then load_conf; info "已安装，内部端口 $PORT，外部端口 $EXT_PORT"; else warn "还没有安装。"; return; fi
@@ -485,6 +500,9 @@ do_status() {
 	if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then info "服务运行正常。"; else err "服务没响应，试试重新安装或看日志。"; fi
 }
 
+# ---------- 卸载 ----------
+# 删得干干净净：服务、程序、配置、聊天数据、运行用户，以及安装时脚本自己加的那条防火墙规则。
+# 不会卸载你的防火墙软件，也不会删你原来就有的规则。curl 等常用工具保留（别的程序可能也在用）。
 do_uninstall() {
 	need_root; detect_os
 	if [ "$MIYU_YES" = "1" ]; then REPLY="yes"
@@ -517,6 +535,9 @@ do_uninstall() {
 	info "卸载完成，所有文件都已删除。"
 }
 
+# ---------- 入口 ----------
+# 所有代码都包在函数里，最后一行才真正开始执行：
+# 这样用 curl | sh 时就算网络中断只下载了一半，也不会执行半截脚本。
 main() {
 	case "${1:-install}" in
 		install) do_install ;;
