@@ -305,6 +305,12 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 		if c.pub != "" {
 			h.remove(c)
 			db.Exec(`UPDATE users SET seen=? WHERE pub=?`, now(), c.pub)
+			// 这个身份的最后一个页面也断开了：告诉好友“已离线”，否则好友那边会一直显示在线
+			if !h.online(c.pub) {
+				for _, f := range friendsOf(c.pub) {
+					h.push(f.ID, map[string]any{"t": "presence", "id": c.pub, "online": false})
+				}
+			}
 		}
 		conn.Close()
 	}()
