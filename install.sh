@@ -14,6 +14,8 @@
 #    MIYU_PORT=8080 MIYU_EXT_PORT=8080 sh install.sh     直接指定端口，不再提问
 #    MIYU_YES=1 sh install.sh uninstall                 卸载时不再二次确认
 #    MIYU_BIN=/root/miyu-chat-linux-amd64 sh install.sh 用你自己下载好的程序文件
+#    MIYU_SHA256=<64位校验值>                            配合 MIYU_BIN，校验你自己下载的文件
+#    MIYU_DOWNLOAD_BASE=http://内网镜像/目录 sh install.sh  从你自己的镜像下载（目录里要有程序和 SHA256SUMS）
 #
 # ---------------------------------------------------------------------
 #  名词小词典（看不懂的词先看这里）：
@@ -225,7 +227,8 @@ ask_port() {
 }
 
 # ---------- 获取最新版本号 ----------
-# 先问 GitHub 接口；被限流时，改看 releases/latest 网页跳转到哪个版本
+# 先问 GitHub 接口；被限流（每小时 60 次）时，改看 releases/latest 网页跳转到哪个版本；
+# 还不行就读 jsDelivr 上 dist 分支里的 VERSION 文件
 get_version() {
 	VER="$(curl -fsS --max-time 10 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
 		| sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1 || true)"
@@ -233,38 +236,77 @@ get_version() {
 		VER="$(curl -fsSI --max-time 10 "https://github.com/$REPO/releases/latest" 2>/dev/null \
 			| tr -d '\r' | sed -n 's#^[Ll]ocation: .*/tag/\(.*\)$#\1#p' | head -n1 || true)"
 	fi
+	if [ -z "$VER" ]; then
+		VER="$(curl -fsS --max-time 10 "https://cdn.jsdelivr.net/gh/$REPO@dist/VERSION" 2>/dev/null | tr -d ' \r\n' || true)"
+	fi
+	# 只接受 v1.2.3 这种样子，防止奇怪的内容拼进下载地址
+	case "$VER" in v[0-9]*) ;; *) VER="" ;; esac
+	case "$VER" in *[!0-9A-Za-z.+-]*) VER="" ;; esac
+}
+
+# ---------- 校验下载的文件 ----------
+# 对照 SHA256SUMS 里记录的校验值（发布时自动生成），一个字节不对都不会安装。
+# 用法：check_sum 程序文件 SHA256SUMS文件
+check_sum() {
+	command -v sha256sum >/dev/null 2>&1 || die "系统缺少 sha256sum 命令，无法校验程序。Debian/Ubuntu 请装 coreutils，Alpine 请装 busybox。"
+	want="$(awk -v f="$file" '$2==f || $2==("*" f) {print $1; exit}' "$2" 2>/dev/null)"
+	got="$(sha256sum "$1" | awk '{print $1}')"
+	[ -n "$want" ] && [ "$want" = "$got" ]
+}
+
+# 从一个下载地址（目录）拿程序和 SHA256SUMS，并校验；成功返回 0
+fetch_from() {
+	curl -fL --retry 2 --connect-timeout 15 --max-time 180 -o "$tmpd/bin" "$1/$file" 2>/dev/null || return 1
+	curl -fL --retry 2 --connect-timeout 15 --max-time 30 -o "$tmpd/SHA256SUMS" "$1/SHA256SUMS" 2>/dev/null \
+		|| { warn "没下载到校验文件 SHA256SUMS（$1）。"; return 1; }
+	if ! check_sum "$tmpd/bin" "$tmpd/SHA256SUMS"; then
+		warn "校验没通过：下载的程序和官方记录的不一致（可能下载损坏、镜像缓存还没更新或被篡改），这个地址不用了。"
+		return 1
+	fi
+	info "校验通过（SHA256：$got）"
 }
 
 # ---------- 下载程序 ----------
-# 优先用你手动放的文件（MIYU_BIN=路径），其次 GitHub Release，最后 jsDelivr 备用地址
+# 优先用你手动放的文件（MIYU_BIN=路径），其次 GitHub Release，最后 jsDelivr 备用地址。
+# 不管从哪下载，都先核对 SHA256 校验值，通过了才会运行它。
 download_bin() {
-	tmp="$(mktemp)"
+	tmpd="$(mktemp -d)"
 	file="$APP-linux-$ARCH"
 	ok=0
 	if [ -n "$MIYU_BIN" ]; then
-		[ -f "$MIYU_BIN" ] || die "MIYU_BIN 指定的文件不存在：$MIYU_BIN"
-		cp "$MIYU_BIN" "$tmp" && ok=1 && info "使用本地程序文件：$MIYU_BIN"
-	fi
-	if [ $ok = 0 ]; then
+		[ -f "$MIYU_BIN" ] || { rm -rf "$tmpd"; die "MIYU_BIN 指定的文件不存在：$MIYU_BIN"; }
+		cp "$MIYU_BIN" "$tmpd/bin"
+		if [ -n "$MIYU_SHA256" ]; then
+			printf '%s  %s\n' "$MIYU_SHA256" "$file" > "$tmpd/SHA256SUMS"
+			check_sum "$tmpd/bin" "$tmpd/SHA256SUMS" || { rm -rf "$tmpd"; die "MIYU_BIN 文件的校验值和 MIYU_SHA256 不一致，请重新下载。"; }
+		else
+			warn "使用本地文件且没给 MIYU_SHA256，跳过校验，请自己确认文件来源可靠。"
+		fi
+		ok=1; info "使用本地程序文件：$MIYU_BIN"
+	elif [ -n "$MIYU_DOWNLOAD_BASE" ]; then
+		info "从指定地址下载：$MIYU_DOWNLOAD_BASE"
+		fetch_from "${MIYU_DOWNLOAD_BASE%/}" && ok=1
+	else
 		get_version
 		if [ -n "$VER" ]; then
 			info "最新版本：$VER，正在从 GitHub 下载…"
-			curl -fL --retry 2 --max-time 120 -o "$tmp" "https://github.com/$REPO/releases/download/$VER/$file" 2>/dev/null && ok=1
+			fetch_from "https://github.com/$REPO/releases/download/$VER" && ok=1
+		fi
+		if [ $ok = 0 ]; then
+			warn "GitHub 下载失败，改用 jsDelivr 备用地址…"
+			fetch_from "https://cdn.jsdelivr.net/gh/$REPO@dist" && ok=1
 		fi
 	fi
-	if [ $ok = 0 ]; then
-		warn "GitHub 下载失败，改用 jsDelivr 备用地址…"
-		curl -fL --retry 2 --max-time 120 -o "$tmp" "https://cdn.jsdelivr.net/gh/$REPO@dist/$file" 2>/dev/null && ok=1
-	fi
-	[ $ok = 1 ] || { rm -f "$tmp"; die "程序下载失败。请检查这台机器能不能访问 github.com，或者稍后再试。"; }
+	[ $ok = 1 ] || { rm -rf "$tmpd"; die "程序下载失败。请检查这台机器能不能访问 github.com 或 cdn.jsdelivr.net，稍后再试。"; }
 
 	# 检查下载的确实是能运行的程序，而不是一个报错网页
-	if [ "$(head -c 4 "$tmp" | od -An -c | tr -d ' ')" != "177ELF" ]; then
-		rm -f "$tmp"; die "下载到的文件不是程序（可能被网络劫持或地址失效），请稍后重试。"
+	if [ "$(head -c 4 "$tmpd/bin" | od -An -c | tr -d ' ')" != "177ELF" ]; then
+		rm -rf "$tmpd"; die "下载到的文件不是程序（可能被网络劫持或地址失效），请稍后重试。"
 	fi
-	chmod 755 "$tmp"
-	"$tmp" -version >/dev/null 2>&1 || { rm -f "$tmp"; die "程序无法在这台机器上运行，可能是 CPU 架构不匹配。"; }
-	mv -f "$tmp" "$BIN"
+	chmod 755 "$tmpd/bin"
+	"$tmpd/bin" -version >/dev/null 2>&1 || { rm -rf "$tmpd"; die "程序无法在这台机器上运行，可能是 CPU 架构不匹配。"; }
+	mv -f "$tmpd/bin" "$BIN"
+	rm -rf "$tmpd"
 	info "程序已安装到 $BIN（$("$BIN" -version 2>&1)）"
 }
 
