@@ -311,9 +311,11 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 
 	// 写协程
 	done := make(chan struct{})
+	writerExit := make(chan struct{})
 	go func() {
 		ping := time.NewTicker(30 * time.Second)
 		defer ping.Stop()
+		defer close(writerExit)
 		for {
 			select {
 			case b := <-c.send:
@@ -329,12 +331,26 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case <-done:
-				return
+				// 读协程要断开了：先把队列里剩下的消息（比如“密钥校验失败”）发完，浏览器才知道为什么被断开
+				for {
+					select {
+					case b := <-c.send:
+						conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+						if conn.WriteMessage(websocket.TextMessage, b) != nil {
+							return
+						}
+					default:
+						conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+						conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+						return
+					}
+				}
 			}
 		}
 	}()
 	defer func() {
 		close(done)
+		<-writerExit
 		if c.pub != "" {
 			h.remove(c)
 			db.Exec(`UPDATE users SET seen=? WHERE pub=?`, now(), c.pub)
