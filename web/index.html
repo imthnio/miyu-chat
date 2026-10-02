@@ -15,7 +15,11 @@
     <p class="muted">端到端加密聊天。没有账号密码，你的密钥就是你的身份。</p>
     <label for="keyInput">输入你的密钥（64 位）</label>
     <textarea id="keyInput" rows="3" placeholder="粘贴你的私钥" autocomplete="off" spellcheck="false"></textarea>
-    <label class="check"><input type="checkbox" id="remember"> 在这个浏览器上记住密钥（公共电脑别勾）</label>
+    <label class="check"><input type="checkbox" id="remember"> 在这个浏览器上记住密钥（用本地密码加密保存，公共电脑别勾）</label>
+    <!-- 勾选“记住密钥”后才显示：设置一个本地密码，私钥会用它加密后再存进浏览器 -->
+    <input id="rememberPwd" class="hidden" type="password" placeholder="设置本地密码（至少 6 位，只用来在这个浏览器上解锁）" autocomplete="new-password">
+    <p id="rememberHint" class="muted small hidden"></p>
+    <p id="loginNote" class="warn hidden"></p>
     <button id="loginBtn" class="primary">登录</button>
     <div class="sep">还没有密钥？</div>
     <button id="genBtn">生成新密钥</button>
@@ -28,7 +32,21 @@
   </div>
 </section>
 
+<!-- 解锁页：浏览器里存着加密过的私钥时显示，输入本地密码解锁 -->
+<section id="unlock" class="screen hidden">
+  <div class="card">
+    <h1>🔐 密语</h1>
+    <p class="muted">这个浏览器保存了你加密过的密钥，输入本地密码就能登录。</p>
+    <label for="unlockPwd">本地密码</label>
+    <input id="unlockPwd" type="password" placeholder="输入你设置的本地密码" autocomplete="current-password">
+    <button id="unlockBtn" class="primary">解锁</button>
+    <button id="forgetBtn" class="link">换一个密钥登录</button>
+    <p id="unlockErr" class="err"></p>
+  </div>
+</section>
+
 <!-- 聊天主界面 -->
+
 <section id="app" class="screen hidden">
   <aside id="side">
     <div class="me">

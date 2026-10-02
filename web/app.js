@@ -3,6 +3,9 @@
 //   私钥（seed）：32 字节随机数，用 64 位十六进制表示，是你唯一的登录凭证。
 //   ID：由私钥算出的 Ed25519 签名公钥，发给朋友用来加好友。
 //   加密公钥：由私钥派生的 X25519 公钥，用于和好友协商加密密钥；它被你的签名公钥签过名，服务器无法偷换。
+//   本地密码：勾选“记住密钥”时设置。浏览器用它把私钥加密后再存起来（PBKDF2 把密码慢慢算成钥匙，
+//            再用 AES-GCM 加密），别人拿到浏览器存储也只看到密文。密码不会发给服务器。
+//   安全上下文：浏览器只在 https:// 网页（或本机 localhost）里提供加密功能，所以“记住密钥”需要 HTTPS。
 (() => {
   "use strict";
   const $ = (id) => document.getElementById(id);
@@ -16,7 +19,11 @@
   };
   const toB64 = (u8) => { let s = ""; u8.forEach((b) => (s += String.fromCharCode(b))); return btoa(s); };
   const fromB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-  const KEY_STORE = "miyu.key";
+  const KEY_STORE = "miyu.key";        // 旧版：明文保存的私钥（已不安全，读到就删除）
+  const KEY_STORE_V2 = "miyu.key.v2";  // 新版：用本地密码加密后的私钥 {v:2,salt,iv,ct,iter}
+  const PBKDF2_ITER = 600000;          // 密码算钥匙的轮数：越大越难被暴力猜，解锁时大约要等半秒
+  const canRemember = !!(window.isSecureContext && window.crypto && crypto.subtle);
+  let pendingSave = null;              // 登录成功后要用来加密保存私钥的本地密码（存完立刻清掉）
 
   // ---------- 状态 ----------
   let keys = null;        // {seed, sign, box, id}
@@ -76,7 +83,37 @@
     return f;
   }
 
+  // ---------- 本地加密保存私钥 ----------
+  // 本地密码 → PBKDF2-SHA256（随机盐）→ AES-GCM 256 位钥匙
+  async function pwKey(pwd, salt, iter) {
+    const base = await crypto.subtle.importKey("raw", enc.encode(pwd), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey({ name: "PBKDF2", hash: "SHA-256", salt, iterations: iter },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  }
+  // 加密私钥后存进浏览器：每次都用新的随机盐（16 字节）和随机 iv（12 字节）
+  async function saveSeed(seed, pwd) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await pwKey(pwd, salt, PBKDF2_ITER);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, seed));
+    localStorage.setItem(KEY_STORE_V2, JSON.stringify({ v: 2, salt: toB64(salt), iv: toB64(iv), ct: toB64(ct), iter: PBKDF2_ITER }));
+  }
+  // 用密码解开保存的私钥。密码不对时浏览器会抛出 OperationError
+  async function loadSeed(pwd) {
+    let o;
+    try { o = JSON.parse(localStorage.getItem(KEY_STORE_V2)); } catch { o = null; }
+    if (!o || o.v !== 2 || !Number.isSafeInteger(o.iter) || o.iter < 100000 || o.iter > 10000000) throw new Error("bad store");
+    const key = await pwKey(pwd, fromB64(o.salt), o.iter);
+    const pt = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: fromB64(o.iv) }, key, fromB64(o.ct)));
+    if (pt.length !== 32) throw new Error("bad store");
+    return pt;
+  }
+  function forgetKey() { localStorage.removeItem(KEY_STORE_V2); localStorage.removeItem(KEY_STORE); }
+
   // ---------- 登录页 ----------
+  // 勾选“记住密钥”才显示本地密码输入框
+  $("remember").onchange = () => $("rememberPwd").classList.toggle("hidden", !$("remember").checked);
+  $("rememberPwd").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("loginBtn").click(); } });
   $("genBtn").onclick = () => {
     const seed = nacl.randomBytes(32);
     const hex = toHex(seed);
@@ -88,8 +125,42 @@
   $("loginBtn").onclick = () => {
     const seed = parseSeed($("keyInput").value);
     if (!seed) { $("loginErr").textContent = "密钥格式不对：应该是 64 位的 0-9 和 a-f 组合。"; return; }
-    if ($("remember").checked) localStorage.setItem(KEY_STORE, toHex(seed)); else localStorage.removeItem(KEY_STORE);
+    pendingSave = null;
+    if ($("remember").checked && canRemember) {
+      const pwd = $("rememberPwd").value;
+      if (pwd.length < 6) { $("loginErr").textContent = "要记住密钥，请先设置至少 6 位的本地密码（只用来在这个浏览器上解锁，不会发给服务器）。"; $("rememberPwd").focus(); return; }
+      pendingSave = pwd; // 等登录成功后再加密保存，免得存下一把登录不了的密钥
+    } else {
+      forgetKey();
+    }
+    $("rememberPwd").value = "";
     start(seed);
+  };
+
+  // ---------- 解锁页 ----------
+  $("unlockBtn").onclick = async () => {
+    const pwd = $("unlockPwd").value;
+    if (!pwd) { $("unlockErr").textContent = "请输入本地密码。"; return; }
+    if (!canRemember) { $("unlockErr").textContent = "现在不是 https:// 网页，浏览器不允许解密。请用 https:// 地址打开，或者点“换一个密钥登录”。"; return; }
+    $("unlockBtn").disabled = true; $("unlockErr").textContent = "正在解锁…";
+    let seed;
+    try {
+      seed = await loadSeed(pwd);
+    } catch (e) {
+      $("unlockErr").textContent = e && e.name === "OperationError"
+        ? "密码不对，请再试一次。忘了密码就点“换一个密钥登录”，用你抄下来的私钥重新登录。"
+        : "保存的密钥数据损坏了，请点“换一个密钥登录”重新输入私钥。";
+      return;
+    } finally { $("unlockBtn").disabled = false; }
+    $("unlockPwd").value = ""; $("unlockErr").textContent = "";
+    $("remember").checked = true;
+    start(seed);
+  };
+  $("unlockPwd").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("unlockBtn").click(); } });
+  $("forgetBtn").onclick = () => {
+    if (!confirm("将删除这个浏览器里保存的密钥，之后需要重新输入私钥登录。确定？")) return;
+    forgetKey();
+    $("unlock").classList.add("hidden"); $("login").classList.remove("hidden");
   };
   $("keyInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("loginBtn").click(); } });
 
@@ -97,14 +168,14 @@
     keys = deriveKeys(seed);
     stopped = false; retry = 0;
     $("loginErr").textContent = "";
-    $("login").classList.add("hidden");
+    $("login").classList.add("hidden"); $("unlock").classList.add("hidden");
     $("app").classList.remove("hidden");
     $("myId").textContent = keys.id;
     connect();
   }
   $("logoutBtn").onclick = () => {
     if (!confirm("退出后需要重新输入私钥才能登录。确定退出？")) return;
-    localStorage.removeItem(KEY_STORE);
+    forgetKey(); pendingSave = null;
     location.reload();
   };
 
@@ -157,6 +228,12 @@
       }
       case "ready":
         retry = 0; setConn(true, "已连接 · 端到端加密");
+        // 第一次登录成功并勾了“记住密钥”：现在才加密保存
+        if (pendingSave) {
+          const pwd = pendingSave; pendingSave = null;
+          saveSeed(keys.seed, pwd).then(() => toast("密钥已用本地密码加密保存，下次输入密码即可登录"),
+            () => toast("保存密钥失败，下次需要重新输入私钥"));
+        }
         me = m.me; $("myName").value = me.name || "";
         friends.clear(); requests.clear();
         m.friends.forEach(prepFriend);
@@ -214,7 +291,7 @@
   // 这些错误码表示“登录不了”，自动重连只会一直失败，所以停下来回到登录页
   const FATAL_CODES = new Set(["bad_auth"]);
   function backToLogin(msg, code) {
-    stopped = true;
+    stopped = true; pendingSave = null;
     if (ws) ws.close();
     setConn(false, "未登录");
     $("app").classList.add("hidden");
@@ -396,7 +473,31 @@
     if (confirm("删除好友，同时双删全部聊天记录？")) send({ t: "unfriend", with: active });
   };
 
-  // 记住了密钥就自动登录
-  const saved = localStorage.getItem(KEY_STORE);
-  if (saved) { const s = parseSeed(saved); if (s) { $("remember").checked = true; start(s); } }
+  // ---------- 打开网页时 ----------
+  // 旧版把私钥明文存在浏览器里：立刻删除。私钥帮用户填进输入框，提醒设置本地密码重新保存。
+  const old = localStorage.getItem(KEY_STORE);
+  if (old !== null) {
+    localStorage.removeItem(KEY_STORE);
+    const s = parseSeed(old);
+    if (s && !localStorage.getItem(KEY_STORE_V2)) {
+      $("keyInput").value = toHex(s);
+      $("loginNote").textContent = "旧版把私钥明文存在了浏览器里，已经删除。私钥已帮你填好：想继续记住，请勾选“记住密钥”并设置本地密码后登录。";
+      $("loginNote").classList.remove("hidden");
+    }
+  }
+  // http 网页（不是本机）没有加密功能：禁用“记住密钥”并说明原因
+  if (!canRemember) {
+    $("remember").checked = false; $("remember").disabled = true;
+    $("rememberHint").textContent = "当前是 http:// 网页，浏览器不提供加密功能，无法安全地记住密钥。用 https:// 地址（例如接上 Cloudflare）打开就能用。";
+    $("rememberHint").classList.remove("hidden");
+  }
+  $("remember").onchange(); // 浏览器刷新后可能还记着勾选状态，同步一下密码框显示
+
+  // 保存过加密的私钥：显示解锁页
+  if (localStorage.getItem(KEY_STORE_V2)) {
+    $("login").classList.add("hidden"); $("unlock").classList.remove("hidden");
+    if (!canRemember) $("unlockErr").textContent = "现在不是 https:// 网页，浏览器不允许解密。请用 https:// 地址打开，或者点“换一个密钥登录”。";
+    else $("unlockPwd").focus();
+  }
+
 })();
