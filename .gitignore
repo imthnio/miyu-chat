@@ -1,0 +1,5 @@
+*.db
+*.db-*
+/dist/
+/miyu-chat
+/miyu-chat-linux-*

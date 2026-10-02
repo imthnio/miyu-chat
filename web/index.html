@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>密语 · 加密聊天</title>
+<link rel="icon" href="favicon.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!-- 登录页：用密钥登录，或者生成一把新密钥 -->
+<section id="login" class="screen">
+  <div class="card">
+    <h1>🔐 密语</h1>
+    <p class="muted">端到端加密聊天。没有账号密码，你的密钥就是你的身份。</p>
+    <label for="keyInput">输入你的密钥（64 位）</label>
+    <textarea id="keyInput" rows="3" placeholder="粘贴你的私钥" autocomplete="off" spellcheck="false"></textarea>
+    <label class="check"><input type="checkbox" id="remember"> 在这个浏览器上记住密钥（公共电脑别勾）</label>
+    <button id="loginBtn" class="primary">登录</button>
+    <div class="sep">还没有密钥？</div>
+    <button id="genBtn">生成新密钥</button>
+    <div id="newKeyBox" class="hidden">
+      <p class="warn">⚠️ 这是你的私钥，请立刻抄下来或存进密码管理器。丢了就再也登录不了这个身份，服务器也找不回。不要发给任何人。</p>
+      <code id="newKey" class="keytext"></code>
+      <button id="copyNewKey">复制私钥</button>
+    </div>
+    <p id="loginErr" class="err"></p>
+  </div>
+</section>
+
+<!-- 聊天主界面 -->
+<section id="app" class="screen hidden">
+  <aside id="side">
+    <div class="me">
+      <div class="row">
+        <input id="myName" maxlength="24" placeholder="设置昵称（好友能看到）">
+        <button id="saveName" class="small">保存</button>
+      </div>
+      <div class="muted small">我的 ID（发给朋友加好友）</div>
+      <div class="row"><code id="myId" class="idtext"></code><button id="copyId" class="small">复制</button></div>
+      <div class="row status"><span id="connState" class="dot off"></span><span id="connText">连接中…</span><button id="logoutBtn" class="small link">退出</button></div>
+    </div>
+    <div class="add">
+      <input id="addInput" placeholder="输入好友 ID 添加" spellcheck="false">
+      <button id="addBtn" class="small primary">添加</button>
+    </div>
+    <div id="requests"></div>
+    <ul id="friends"></ul>
+  </aside>
+
+  <main id="chat">
+    <header id="chatHead">
+      <button id="backBtn" class="small link">← 返回</button>
+      <div class="title"><div id="peerName">选择一个好友开始聊天</div><code id="peerId" class="muted small"></code></div>
+      <div class="actions hidden" id="chatActions">
+        <button id="clearBtn" class="small danger">双删全部记录</button>
+        <button id="unfriendBtn" class="small link">删除好友</button>
+      </div>
+    </header>
+    <div id="msgs"><button id="moreBtn" class="small link hidden">加载更早的消息</button></div>
+    <footer id="composer" class="hidden">
+      <textarea id="text" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+      <button id="sendBtn" class="primary">发送</button>
+    </footer>
+  </main>
+</section>
+
+<div id="toast" class="hidden"></div>
+<script src="nacl-fast.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
