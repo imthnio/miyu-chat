@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC1111
 # =====================================================================
 #  密语 miyu-chat 一键安装脚本
 #  支持系统：Debian / Ubuntu（systemd）、Alpine（OpenRC）
@@ -74,6 +75,7 @@ need_root() {
 # 看 /etc/os-release 判断是 Alpine 还是 Debian/Ubuntu，决定用 apk 还是 apt、OpenRC 还是 systemd
 detect_os() {
 	[ -f /etc/os-release ] || die "认不出你的系统（没有 /etc/os-release）。本脚本只支持 Debian、Ubuntu、Alpine。"
+	# shellcheck source=/dev/null
 	. /etc/os-release
 	case "$ID" in
 		alpine) OS="alpine"; INIT="openrc" ;;
@@ -114,6 +116,7 @@ install_deps() {
 		[ -f /etc/ssl/certs/ca-certificates.crt ] || need="$need ca-certificates"
 		if [ -n "$need" ]; then
 			info "正在安装缺少的工具：$need"
+			# shellcheck disable=SC2086 # $need 里可能有多个包名，故意不加引号让它拆开
 			apk add --no-cache $need >/dev/null || die "安装 $need 失败，请检查网络或软件源后重试。"
 		fi
 	else
@@ -223,6 +226,10 @@ ask_port() {
 			*[!0-9]*) warn "输入的不是数字，先按和内部端口相同处理。" ;;
 			*) EXT_PORT="$e" ;;
 		esac
+	fi
+	case "$EXT_PORT" in ''|*[!0-9]*) EXT_PORT="$PORT" ;; esac
+	if [ "$EXT_PORT" -lt 1 ] || [ "$EXT_PORT" -gt 65535 ]; then
+		warn "外部端口 $EXT_PORT 不在 1-65535 之间，先按和内部端口相同处理。"; EXT_PORT="$PORT"
 	fi
 }
 
@@ -383,23 +390,43 @@ RC
 }
 
 # ---------- 防火墙放行 ----------
-# 只给自己的端口加规则，不会关掉或卸载你的防火墙
+# 只给自己的端口加规则，不会关掉或卸载你的防火墙。
+# 只有“本来没有、是脚本新加的”规则才记到配置文件里，卸载时也只删这一条，不碰你原有的规则。
 open_firewall() {
 	FW=""
 	if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-		ufw allow "$PORT"/tcp comment "$APP" >/dev/null && FW="ufw"
-		info "已在 ufw 防火墙放行 $PORT 端口。"
+		if ufw status 2>/dev/null | grep -Eq "^$PORT/tcp[[:space:]]+ALLOW"; then
+			info "ufw 里本来就放行了 $PORT 端口，不重复添加（卸载时也不会删它）。"
+		elif ufw allow "$PORT"/tcp comment "$APP" >/dev/null 2>&1; then
+			FW="ufw"; info "已在 ufw 防火墙放行 $PORT 端口。"
+		else
+			warn "ufw 放行失败，请自己执行：ufw allow $PORT/tcp"
+		fi
 	elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-		firewall-cmd --permanent --add-port="$PORT"/tcp >/dev/null && firewall-cmd --reload >/dev/null && FW="firewalld"
-		info "已在 firewalld 防火墙放行 $PORT 端口。"
+		if firewall-cmd --query-port="$PORT"/tcp >/dev/null 2>&1; then
+			info "firewalld 里本来就放行了 $PORT 端口，不重复添加（卸载时也不会删它）。"
+		elif firewall-cmd --permanent --add-port="$PORT"/tcp >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1; then
+			FW="firewalld"; info "已在 firewalld 防火墙放行 $PORT 端口。"
+		else
+			warn "firewalld 放行失败，请自己执行：firewall-cmd --permanent --add-port=$PORT/tcp && firewall-cmd --reload"
+		fi
 	elif command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q "policy drop"; then
-		warn "检测到 nftables 默认拦截入站。为了不弄乱你的规则，脚本不自动改，请自己复制执行："
+		warn "检测到 nftables 默认拦截入站。为了不弄乱你的规则，脚本不自动改，请自己复制执行（表名/链名按你的实际配置改）："
 		echo "    nft add rule inet filter input tcp dport $PORT accept"
 	elif command -v iptables >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -q -- "-P INPUT DROP"; then
 		warn "检测到 iptables 默认拦截入站。请自己复制执行放行命令："
 		echo "    iptables -I INPUT -p tcp --dport $PORT -j ACCEPT"
 	fi
 	printf 'PORT=%s\nEXT_PORT=%s\nFW=%s\n' "$PORT" "$EXT_PORT" "$FW" > "$CONF"
+}
+
+# ---------- 读取安装时记下的配置 ----------
+# 只按固定格式把数字和名字读出来，不直接执行配置文件，就算文件被改坏也不会乱执行命令
+load_conf() {
+	PORT="$(sed -n 's/^PORT=\([0-9]\{1,5\}\)$/\1/p' "$CONF" | head -n1)"
+	EXT_PORT="$(sed -n 's/^EXT_PORT=\([0-9]\{1,5\}\)$/\1/p' "$CONF" | head -n1)"
+	FW="$(sed -n 's/^FW=\([a-z]*\)$/\1/p' "$CONF" | head -n1)"
+	[ -n "$EXT_PORT" ] || EXT_PORT="$PORT"
 }
 
 # ---------- 检查服务是否真的跑起来了 ----------
@@ -444,7 +471,7 @@ do_install() {
 do_update() {
 	need_root; detect_os; detect_arch; install_deps
 	[ -f "$CONF" ] || die "还没有安装过，请先运行：sh install.sh"
-	. "$CONF"
+	load_conf
 	download_bin
 	if [ "$INIT" = "systemd" ]; then systemctl restart $APP; else rc-service $APP restart >/dev/null; fi
 	health_check
@@ -453,8 +480,8 @@ do_update() {
 
 do_status() {
 	detect_os
-	if [ -f "$CONF" ]; then . "$CONF"; info "已安装，内部端口 $PORT，外部端口 $EXT_PORT"; else warn "还没有安装。"; return; fi
-	if [ "$INIT" = "systemd" ]; then systemctl --no-pager status $APP | head -n 5; else rc-service $APP status; fi
+	if [ -f "$CONF" ]; then load_conf; info "已安装，内部端口 $PORT，外部端口 $EXT_PORT"; else warn "还没有安装。"; return; fi
+	if [ "$INIT" = "systemd" ]; then systemctl --no-pager status $APP | head -n 5; else rc-service $APP status || true; fi
 	if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then info "服务运行正常。"; else err "服务没响应，试试重新安装或看日志。"; fi
 }
 
@@ -464,7 +491,7 @@ do_uninstall() {
 	else ask "卸载会删除程序、服务和【全部聊天数据】，无法恢复。确定吗？输入 yes 继续："; fi
 	[ "$REPLY" = "yes" ] || { info "已取消卸载。"; exit 0; }
 	PORT=""; FW=""
-	[ -f "$CONF" ] && . "$CONF"
+	if [ -f "$CONF" ]; then load_conf; fi
 	# 停止并删除服务
 	if [ "$INIT" = "systemd" ]; then
 		systemctl disable --now $APP >/dev/null 2>&1 || true
@@ -477,7 +504,9 @@ do_uninstall() {
 	fi
 	# 删掉安装时加的防火墙规则
 	if [ -n "$PORT" ] && [ "$FW" = "ufw" ]; then ufw delete allow "$PORT"/tcp >/dev/null 2>&1 || true; fi
-	if [ -n "$PORT" ] && [ "$FW" = "firewalld" ]; then firewall-cmd --permanent --remove-port="$PORT"/tcp >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || true; fi
+	if [ -n "$PORT" ] && [ "$FW" = "firewalld" ]; then
+		if firewall-cmd --permanent --remove-port="$PORT"/tcp >/dev/null 2>&1; then firewall-cmd --reload >/dev/null 2>&1 || true; fi
+	fi
 	# 删程序、数据、配置和运行用户
 	rm -f "$BIN" "$CONF"
 	rm -rf "$DATA_DIR"
@@ -488,10 +517,14 @@ do_uninstall() {
 	info "卸载完成，所有文件都已删除。"
 }
 
-case "${1:-install}" in
-	install) do_install ;;
-	uninstall|remove) do_uninstall ;;
-	update|upgrade) do_update ;;
-	status) do_status ;;
-	*) echo "用法：sh install.sh [install|uninstall|update|status]"; exit 1 ;;
-esac
+main() {
+	case "${1:-install}" in
+		install) do_install ;;
+		uninstall|remove) do_uninstall ;;
+		update|upgrade) do_update ;;
+		status) do_status ;;
+		*) echo "用法：sh install.sh [install|uninstall|update|status]"; exit 1 ;;
+	esac
+}
+
+main "$@"
