@@ -10,11 +10,15 @@
 #       不用公网 IP、不用开防火墙端口、不用端口映射（NAT 小鸡推荐）
 #
 #  用法：
-#    安装：  sh install.sh            （或 sh install.sh install；已经装过时会让你选“修改设置 / 更新 / 退出”）
-#    改设置：sh install.sh config     （切换直连/Tunnel 模式、换 Tunnel 令牌、改邀请码和上限，聊天数据保留）
-#    卸载：  sh install.sh uninstall  （删除程序、服务、数据、防火墙规则、本脚本装的 cloudflared，删得干干净净）
-#    更新：  sh install.sh update     （只换程序，聊天数据和设置都保留；Tunnel 模式可顺便更新 cloudflared）
-#    状态：  sh install.sh status
+#    安装：  用 README 里的一键命令（会把本脚本下载到 /tmp/miyu-install.sh 再运行）
+#    装好以后，脚本会顺便装一个管理命令 miyu（在任何目录下都能用，重启也不会丢）：
+#    菜单：  miyu                （已经装过时显示菜单：修改设置 / 更新 / 状态 / 卸载 / 退出）
+#    改设置：miyu config         （切换直连/Tunnel 模式、换 Tunnel 令牌、改聊天网址、邀请码和上限，聊天数据保留）
+#    更新：  miyu update         （换最新程序，同时把 miyu 命令自己也更新到最新；聊天数据和设置都保留）
+#    状态：  miyu status
+#    卸载：  miyu uninstall      （删除程序、服务、数据、防火墙规则、本脚本装的 cloudflared 和 miyu 命令，删得干干净净）
+#    直接运行脚本文件也可以，效果一样：sh install.sh config / update / status / uninstall
+#    如果 /usr/local/bin/miyu 已经被别的软件占用了，脚本不会覆盖它，会改用 miyu-chat-ctl 这个名字（装完会提示）。
 #
 #  免交互安装（给会写脚本的人用，可选）：
 #    MIYU_PORT=8080 MIYU_EXT_PORT=8080 sh install.sh     直接指定端口，不再提问
@@ -24,10 +28,11 @@
 #    MIYU_INVITE_CODE=random 或 none 或 你自己的邀请码     random=随机生成，none=不设置（默认不设置）
 #    MIYU_MAX_USERS=50 MIYU_MAX_DB_MB=2000              最多多少用户、数据库最大多少 MB（0 = 不限制）
 #    MIYU_CF_UPDATE=1 或 0                               更新时要不要顺便更新 cloudflared
-#    MIYU_YES=1 sh install.sh uninstall                 卸载时不再二次确认
+#    MIYU_YES=1 miyu uninstall                          卸载时不再二次确认
 #    MIYU_BIN=/root/miyu-chat-linux-amd64 sh install.sh 用你自己下载好的程序文件
 #    MIYU_SHA256=<64位校验值>                            配合 MIYU_BIN，校验你自己下载的文件
 #    MIYU_DOWNLOAD_BASE=http://内网镜像/目录 sh install.sh  从你自己的镜像下载（目录里要有程序和 SHA256SUMS）
+#    MIYU_SCRIPT_URL=http://内网镜像/install.sh            miyu update 时从这个地址取最新的管理脚本（不设置 = GitHub，失败换 jsDelivr）
 #
 # ---------------------------------------------------------------------
 #  名词小词典（看不懂的词先看这里）：
@@ -59,14 +64,21 @@
 #              外面直接连不上，只能经过 Cloudflare Tunnel 进来，更安全。
 #    邀请码：设置后，新用户第一次登录要先输入它，陌生人就没法在你的服务器上注册。
 #    登录网址（MIYU_HOST）：新版程序登录时会核对浏览器地址栏里的网址（域名[:端口]），只认这里列出的，
-#              防止别的网站转发登录。填错了大家都会登录失败（提示“密钥校验失败”），可以用 sh install.sh config 改。
+#              防止别的网站转发登录。填错了大家都会登录失败（提示“密钥校验失败”），可以用 miyu config 改。
 #    环境变量文件：/etc/miyu-chat/miyu.env，放登录网址、邀请码、上限这些设置，权限 0600，只有 root 能看；
 #              服务管家启动程序时把它交给程序，所以这些设置不会出现在命令行参数里（别人用 ps 看不到）。
 #    0600 权限：文件只有它的主人（root 或指定的服务用户）能读写，其他用户连看都看不到。
+#    miyu 管理命令：装好以后在任何目录下输入 miyu 就能管理聊天服务（修改设置 / 更新 / 状态 / 卸载）。
+#              它是 /usr/local/bin/miyu 这个小文件，只负责去运行保存好的脚本 /usr/local/lib/miyu-chat/install.sh。
+#              不用再找当初下载的 /tmp/miyu-install.sh（/tmp 里的文件重启后常常会被系统清掉）。
+#              运行 miyu update 时，会从 GitHub（连不上就换 jsDelivr）下载最新脚本，检查没问题才替换，所以命令一直是最新的。
 # =====================================================================
 
 # 出错就停，避免装到一半留下烂摊子
 set -e
+
+# 本脚本的版本号（miyu update 时靠它判断下载到的脚本是不是更新）
+SCRIPT_VER="1.1.1"
 
 # ---------- 基本配置（一般不用改） ----------
 REPO="imthnio/miyu-chat"                 # GitHub 仓库，程序从这里的 Release 下载
@@ -85,6 +97,12 @@ CF_USER="miyu-cf"                        # cloudflared 也用一个不能登录�
 CF_LOG="/var/log/miyu-cloudflared.log"   # Alpine 下 cloudflared 的运行日志
 CF_MARK_BIN="$SECRET_DIR/cloudflared-installed-by-script"  # 有这个文件 = cloudflared 是本脚本装的，卸载时才删程序
 CF_MARK_USER="$SECRET_DIR/cf-user-created-by-script"       # 有这个文件 = miyu-cf 用户是本脚本建的，卸载时才删
+SELF_DIR="/usr/local/lib/miyu-chat"      # 保存一份本脚本，给 miyu 管理命令用
+SELF_COPY="$SELF_DIR/install.sh"         # 保存的脚本（root 所有，权限 0755）
+CMD="/usr/local/bin/miyu"                # 管理命令：在任何目录输入 miyu 就能用
+CMD_ALT="/usr/local/bin/miyu-chat-ctl"   # miyu 这个名字被别的软件占了时，改用这个名字
+CMD_MARK="miyu-chat-managed-command"     # 管理命令文件里的记号，靠它认出“是本脚本装的”，不是就绝不覆盖、不删除
+CMD_NAME="miyu"                          # 提示里显示的命令名（会按实际情况改成 miyu-chat-ctl）
 
 # ---------- 输出带颜色的提示 ----------
 # 绿色是正常信息，黄色是提醒，红色是错误
@@ -133,7 +151,7 @@ ask_secret() {
 # ---------- 必须用 root 运行 ----------
 # 安装服务、写 /usr/local/bin 都需要管理员权限
 need_root() {
-	[ "$(id -u)" = "0" ] || die "请用 root 用户运行（先执行 sudo -i 或 su - 切到 root，再重新运行脚本）。"
+	[ "$(id -u)" = "0" ] || die "请用 root 用户运行（先执行 sudo -i 或 su - 切到 root，再重新运行；用 miyu 命令时也一样）。"
 }
 
 # ---------- 识别系统 ----------
@@ -273,10 +291,11 @@ ask_mode() {
 	if [ "$IS_NAT" = "1" ]; then def=2; fi
 	if [ "$CUR_MODE" = "tunnel" ]; then def=2; elif [ "$CUR_MODE" = "direct" ]; then def=1; fi
 	echo
-	echo "  请选择别人怎么访问你的聊天服务："
-	echo "    1) 直连模式：别人直接访问“公网IP:端口”。需要公网 IP 或商家的端口映射，脚本会帮你放行防火墙端口。"
+	echo "  请选择别人怎么访问你的聊天服务（以后可以用 $CMD_NAME config 随时换，聊天数据不丢）："
+	echo "    1) 直连模式：别人在浏览器里输入“http://公网IP:端口”访问。需要公网 IP 或商家的端口映射，脚本会帮你放行防火墙端口。"
 	echo "    2) Cloudflare Tunnel 模式（NAT 小鸡 / 想藏起真实 IP 推荐）：不用公网 IP、不用开端口、不用端口映射，"
 	echo "       需要一个托管在 Cloudflare 的域名，并在 Cloudflare 后台建好 Tunnel、复制它的令牌。"
+	echo "    拿不准：有域名就选 2；没有域名、只是想先用 IP 试试就选 1。"
 	if [ "$IS_NAT" = "1" ] && [ -z "$CUR_MODE" ]; then
 		warn "检测到你是 NAT 小鸡，推荐选 2（Cloudflare Tunnel 模式）。"
 	fi
@@ -301,11 +320,16 @@ ask_mode() {
 # 直连模式：NAT 小鸡只能用商家分配的端口，所以必须问；最多问 3 次，免得卡死。
 # Tunnel 模式：端口只在本机内部用（cloudflared 从本机连过来），外面访问不到，选个没被占用的就行。
 ask_port() {
+	echo
+	echo "  端口就像这台机器上的“门牌号”（1-65535），聊天程序要占用一个。随便选一个没被占用的数字就行，例如 8080。"
 	if [ "$MODE" = "tunnel" ]; then
-		info "Tunnel 模式下这个端口只在本机内部使用，外面访问不到，不用开防火墙，也不用找商家映射。"
+		info "Tunnel 模式下这个端口只在本机内部使用，外面访问不到，不用开防火墙，也不用找商家映射。记住它，等会儿 Cloudflare 后台要填。"
 	elif [ "$IS_NAT" = "1" ]; then
-		warn "你是 NAT 小鸡：请去商家后台的“端口映射/端口转发”页面，看商家分给你的端口。"
-		warn "这里要填的是“内部端口”（映射到你这台机器里的那个端口）。"
+		warn "你是 NAT 小鸡：好几个人共用一个公网 IP，商家只给你几个端口，所以不能随便选。"
+		warn "请去商家后台的“端口映射/端口转发”页面，那里会写成“外部端口 → 内部端口”，例如 20123 → 20123。"
+		warn "这里要填的是右边的“内部端口”（你这台机器里的那个端口）；下一步再问左边的“外部端口”。"
+	else
+		echo "  直连模式下别人要用“http://公网IP:这个端口”访问，脚本会自动在防火墙放行它。云服务器还要在商家后台的安全组里放行。"
 	fi
 	tries=0
 	PORT=""
@@ -331,7 +355,9 @@ ask_ext_port() {
 	if [ -n "$MIYU_EXT_PORT" ]; then
 		EXT_PORT="$MIYU_EXT_PORT"
 	elif [ "$IS_NAT" = "1" ]; then
-		ask "商家后台里，内部端口 $PORT 对应的“外部端口”是多少？（一样就直接回车）："
+		echo "  外部端口：别人在浏览器里输入的那个端口（http://公网IP:外部端口），商家把它转到你机器里的内部端口 $PORT。"
+		echo "  在商家后台的端口映射里，和内部端口 $PORT 写在同一行的另一个数字就是。两个一样的话直接回车。"
+		ask "内部端口 $PORT 对应的外部端口是多少？（例如 20123；一样就直接回车）："
 		e="$(printf '%s' "$REPLY" | tr -d ' ')"
 		case "$e" in
 			'') ;;
@@ -441,9 +467,10 @@ ask_invite() {
 		return
 	fi
 	echo
-	echo "  要不要设置邀请码？设置后，新用户第一次登录要先输入邀请码，陌生人没法注册。"
+	echo "  要不要设置邀请码？邀请码就像“进门口令”：设置后，新用户第一次登录要先输入它，陌生人就没法注册。"
+	echo "  只给自己和朋友用、网址又可能被别人知道的话，建议选 1。已经注册的人以后登录不用再输。"
 	echo "    1) 自动生成一个随机邀请码（装完会显示一次，记下来发给朋友）"
-	echo "    2) 自己输入邀请码（输入时不显示）"
+	echo "    2) 自己输入邀请码（例如 Friends-2026，输入时不显示）"
 	echo "    3) 不要邀请码（任何能打开网页的人都能注册）"
 	def=3
 	if [ -n "$CUR_INVITE" ]; then echo "    4) 保持现在的邀请码不变"; def=4; fi
@@ -504,7 +531,8 @@ ask_limit() {
 
 ask_limits() {
 	echo
-	echo "  可以给服务器加两个上限（防止被陌生人塞满硬盘），0 表示不限制："
+	echo "  可以给服务器加两个上限（防止被陌生人塞满硬盘），0 表示不限制。不懂就直接回车用默认值，以后可以用 $CMD_NAME config 改："
+	echo "    用户数：最多能注册多少个身份（自己和朋友用，填 20、50 就够）；数据库：聊天记录最多占多少 MB 硬盘。"
 	ask_limit MIYU_MAX_USERS "最多允许多少个用户（身份）？例如 50" 0 10000000 "${MIYU_MAX_USERS+x}" "$MIYU_MAX_USERS"
 	MAX_USERS="$LIMIT"
 	ask_limit MIYU_MAX_DB_MB "聊天数据库最多占多少 MB？小鸡硬盘小建议 2000" 2000 10000000 "${MIYU_MAX_DB_MB+x}" "$MIYU_MAX_DB_MB"
@@ -557,7 +585,8 @@ ask_hosts() {
 		echo
 		echo "  设置聊天网址（登录时会核对浏览器地址栏里的网址，填错了会登录失败、提示“密钥校验失败”）："
 		if [ "$MODE" = "tunnel" ]; then
-			echo "    请填你在 Cloudflare 给这个 Tunnel 配的域名（只填域名，不要 https://），例如 chat.example.com"
+			echo "    请填你打算在 Cloudflare 给这个 Tunnel 配的域名（只填域名，不要 https://），例如 chat.example.com"
+			echo "    免费套餐只支持一级子域名：chat.example.com 可以，chat.abc.example.com 这种会报证书错误。"
 		else
 			echo "    有域名（例如接了 Cloudflare）就填域名，例如 chat.example.com；只用 IP 访问就直接回车。"
 			echo "    脚本会自动再加上“公网IP:外部端口”，用 http://IP:端口 直接打开也能登录。"
@@ -586,7 +615,7 @@ ask_hosts() {
 	clean_hosts "$dom,$ipp" || HOSTS=""
 	HOST_LIST="$HOSTS"
 	if [ -z "$HOST_LIST" ]; then
-		warn "没有设置聊天网址：程序会以浏览器访问时的网址为准，能正常登录，只是少一层防护。以后可以用 sh install.sh config 补上。"
+		warn "没有设置聊天网址：程序会以浏览器访问时的网址为准，能正常登录，只是少一层防护。以后可以用 $CMD_NAME config 补上。"
 	elif [ "$MODE" = "tunnel" ] && [ -z "$dom" ]; then
 		warn "Tunnel 模式建议填上你的聊天域名。"
 	fi
@@ -602,7 +631,7 @@ write_env() {
 	(
 		umask 077
 		{
-			echo "# miyu-chat 的设置（由安装脚本生成，改设置请运行 sh install.sh config）"
+			echo "# miyu-chat 的设置（由安装脚本生成，改设置请运行 miyu config）"
 			echo "# 登录时只认这些网址（逗号分隔，空 = 以浏览器访问的网址为准）"
 			echo "MIYU_HOST=$HOST_LIST"
 			echo "# 邀请码（空 = 不需要邀请码）"
@@ -822,7 +851,7 @@ write_token() {
 
 # ---------- 注册 cloudflared 服务（开机自启、断了自动重启） ----------
 # 服务名叫 miyu-cloudflared，运行：cloudflared tunnel --no-autoupdate run --token-file 令牌文件
-#   --no-autoupdate：不让 cloudflared 自己偷偷升级（升级用 sh install.sh update，会核对校验值）
+#   --no-autoupdate：不让 cloudflared 自己偷偷升级（升级用 miyu update，会核对校验值）
 #   Tunnel 的转发规则（哪个域名转到 http://127.0.0.1:端口）在 Cloudflare 后台配置，这里只负责连上。
 setup_cf_service() {
 	if [ "$INIT" = "systemd" ]; then
@@ -904,7 +933,7 @@ cf_wait_ready() {
 	warn "Tunnel 暂时还没连上 Cloudflare。最常见的原因是令牌复制错了或不完整，也可能是这台机器连不上 Cloudflare。"
 	warn "cloudflared 会自动一直重试。看日志找原因："
 	cf_log_hint
-	warn "换令牌：重新运行 sh install.sh config，选 Tunnel 模式后粘贴新令牌。"
+	warn "换令牌：运行 $CMD_NAME config，选 Tunnel 模式后粘贴新令牌。"
 }
 
 # ---------- 删除 cloudflared 服务和令牌 ----------
@@ -1085,7 +1114,7 @@ load_conf() {
 
 # 改设置、更新、看状态都需要端口；读不到说明配置文件坏了
 need_port() {
-	[ -n "$PORT" ] || die "配置文件 $CONF 里读不到端口，可能被改坏了。请先卸载（sh install.sh uninstall）再重新安装。"
+	[ -n "$PORT" ] || die "配置文件 $CONF 里读不到端口，可能被改坏了。请先卸载（$CMD_NAME uninstall）再重新安装。"
 }
 
 # 把上限显示成中文：空 = 不限制
@@ -1132,7 +1161,14 @@ print_summary() {
 		echo "  Tunnel 令牌保存在 $TOKEN_FILE（权限 0600），不要发给任何人。"
 	else
 		echo "  模式：直连（聊天程序听 0.0.0.0:$PORT）"
-		echo "  本机测试地址：http://${PUBLIC_IP:-你的公网IP}:$EXT_PORT"
+		if [ "$EXT_PORT" = "80" ]; then url="http://${PUBLIC_IP:-你的公网IP}"; else url="http://${PUBLIC_IP:-你的公网IP}:$EXT_PORT"; fi
+		echo "  现在就能试：在电脑或手机浏览器的地址栏里输入下面这一行（是 http 不是 https），回车："
+		echo
+		echo "      $url"
+		echo
+		echo "  能看到“密语”登录页就说明装好了。打不开的话，多半是商家后台的安全组/端口映射没放行，见 README 常见问题。"
+		pick_domains "$HOST_LIST"
+		if [ -n "$DOMAINS" ]; then echo "  按 README 接好 Cloudflare 以后，改用 https://${DOMAINS%%,*} 打开（推荐，复制按钮、记住密钥都需要 HTTPS）。"; fi
 		echo "  接 Cloudflare 时需要的信息："
 		echo "    公网 IP：${PUBLIC_IP:-请到商家后台查看}"
 		echo "    外部端口：$EXT_PORT"
@@ -1145,7 +1181,7 @@ print_summary() {
 	echo
 	if [ -n "$HOST_LIST" ]; then
 		echo "  聊天网址（MIYU_HOST）：$HOST_LIST"
-		echo "    浏览器地址栏里的网址必须是其中之一，否则登录会提示“密钥校验失败”。要改：sh install.sh config"
+		echo "    浏览器地址栏里的网址必须是其中之一，否则登录会提示“密钥校验失败”。要改：$CMD_NAME config"
 	else
 		echo "  聊天网址（MIYU_HOST）：没有设置（以浏览器访问的网址为准）"
 	fi
@@ -1160,9 +1196,18 @@ print_summary() {
 	fi
 	echo "  最多用户数：$(show_limit "$MAX_USERS" " 人")    数据库上限：$(show_limit "$MAX_DB_MB" " MB")"
 	if ! bin_supports_limits; then
-		echo "  注意：现在这个版本的程序还不支持登录网址/邀请码/上限，设置已经保存好，程序更新（sh install.sh update）后自动生效。"
+		echo "  注意：现在这个版本的程序还不支持登录网址/邀请码/上限，设置已经保存好，程序更新（$CMD_NAME update）后自动生效。"
 	fi
-	echo "  改模式、换令牌、改网址、邀请码和上限：sh install.sh config"
+	echo
+	echo "  第一次登录：打开上面的网址 → 点“生成新密钥” → 点“复制私钥”存好（私钥就是账号+密码，丢了找不回）"
+	if [ -n "$INVITE" ]; then echo "             → 在“邀请码”那一栏填邀请码 → 点“登录”。"; else echo "             → 点“登录”。"; fi
+	echo
+	echo "  以后管理（在任何目录输入，不用再找安装脚本）："
+	echo "    $CMD_NAME            打开菜单：修改设置 / 更新 / 状态 / 卸载"
+	echo "    $CMD_NAME config     改模式、换令牌、改网址、邀请码和上限"
+	echo "    $CMD_NAME update     更新到最新版（聊天数据和设置都保留）"
+	echo "    $CMD_NAME status     看运行状态"
+	echo "    $CMD_NAME uninstall  卸载（会删掉全部聊天数据）"
 	echo "  ------------------------------------------------------------"
 	INVITE=""
 }
@@ -1176,7 +1221,7 @@ apply_mode() {
 		setup_cloudflared_bin
 		setup_cf_user
 		write_token
-		[ -s "$TOKEN_FILE" ] || die "还没有 Tunnel 令牌，请重新运行 sh install.sh config 输入令牌。"
+		[ -s "$TOKEN_FILE" ] || die "还没有 Tunnel 令牌，请运行 $CMD_NAME config 输入令牌。"
 		# 从直连切过来：删掉以前为直连加的防火墙规则（Tunnel 不需要开端口）
 		close_firewall
 		EXT_PORT="$PORT"
@@ -1206,7 +1251,9 @@ do_install() {
 	if [ "$MODE" = "tunnel" ]; then ask_token; fi
 	ask_hosts; ask_invite; ask_limits
 	# 后面任何一步出错，都提示怎么清理装了一半的东西
-	trap 'if [ $? -ne 0 ]; then err "安装没有完成。可以运行 sh install.sh uninstall 清理掉装了一半的文件，再重新安装。"; fi' EXIT
+	trap 'if [ $? -ne 0 ]; then err "安装没有完成。可以运行 $CMD_NAME uninstall 清理掉装了一半的文件，再重新安装。"; fi' EXIT
+	# 先把 miyu 管理命令装好：后面万一失败，也能用 miyu uninstall 清理
+	setup_self
 	download_bin
 	apply_mode
 	echo
@@ -1220,34 +1267,42 @@ do_install() {
 }
 
 # ---------- 已经装过时再运行安装命令 ----------
+# 直接输入 miyu（不带动作）、或者再次运行一键命令时，都会来到这里。
+# 先把 miyu 管理命令装好/修好（v1.1.0 装的机器以前没有这个命令），设置一点都不动，然后显示菜单。
 installed_menu() {
 	load_conf; need_port
+	setup_self
 	if [ "$MODE" = "tunnel" ]; then m="Cloudflare Tunnel 模式"; else m="直连模式"; fi
-	warn "检测到已经安装过了（$m，端口 $PORT）。"
+	warn "检测到已经安装过了（$m，端口 $PORT）。管理命令：$CMD_NAME"
 	echo "    1) 修改设置：切换直连/Tunnel 模式、换 Tunnel 令牌、改聊天网址、邀请码和上限（聊天数据保留）"
-	echo "    2) 只更新程序（聊天数据和设置都保留）"
-	echo "    3) 什么都不做，退出"
-	echo "  想换端口：先备份数据，再卸载（sh install.sh uninstall）后重新安装。"
-	ask "请选择（直接回车 = 3）："
+	echo "    2) 更新：换成最新版程序和管理脚本（聊天数据和设置都保留）"
+	echo "    3) 查看状态"
+	echo "    4) 卸载（会删掉全部聊天数据，还会再问你一次）"
+	echo "    5) 什么都不做，退出"
+	echo "  想换端口：先备份数据，再卸载（$CMD_NAME uninstall）后重新安装。"
+	ask "请输入 1~5 选择（直接回车 = 5 退出）："
 	case "$(printf '%s' "$REPLY" | tr -d ' ')" in
 		1) do_config_main ;;
-		2) do_update_main ;;
-		*) info "什么都没改，已退出。" ;;
+		2) update_entry ;;
+		3) do_status ;;
+		4) do_uninstall ;;
+		*) info "什么都没改，已退出。以后输入 $CMD_NAME 就能再打开这个菜单。" ;;
 	esac
 }
 
-# ---------- 修改设置（sh install.sh config） ----------
+# ---------- 修改设置（miyu config） ----------
 # 不重新下载程序、不动聊天数据，端口也不变；可以切换模式、换令牌、改邀请码和上限。
 do_config() {
 	need_root; detect_os; detect_arch; install_deps
-	[ -f "$CONF" ] || die "还没有安装过，请先运行：sh install.sh"
+	[ -f "$CONF" ] || die "还没有安装过，请先用 README 里的一键命令安装（或运行 sh install.sh）。"
+	setup_self
 	do_config_main
 }
 
 do_config_main() {
 	load_conf; need_port
 	CUR_MODE="$MODE"
-	[ -x "$BIN" ] || die "找不到程序 $BIN，请先运行 sh install.sh update 把程序装回来。"
+	[ -x "$BIN" ] || die "找不到程序 $BIN，请先运行 $CMD_NAME update 把程序装回来。"
 	detect_machine; ask_mode
 	if [ "$MODE" = "tunnel" ]; then
 		# 从直连切到 Tunnel 时必须输入令牌（以前的令牌文件不算数）
@@ -1269,7 +1324,23 @@ do_config_main() {
 # Tunnel 模式下，如果 cloudflared 是本脚本装的，可以顺便更新到最新官方版本。
 do_update() {
 	need_root; detect_os; detect_arch; install_deps
-	[ -f "$CONF" ] || die "还没有安装过，请先运行：sh install.sh"
+	[ -f "$CONF" ] || die "还没有安装过，请先用 README 里的一键命令安装（或运行 sh install.sh）。"
+	update_entry
+}
+
+# 先把管理脚本换成最新版；如果真的变新了，就用新版脚本重新跑一遍 update（新版可能修了更新流程里的问题）。
+# MIYU_REEXEC=1 表示“已经是换过的新脚本在跑了”，不再重复下载，防止来回打转。
+update_entry() {
+	if [ "$MIYU_REEXEC" != "1" ]; then
+		refresh_self
+		if [ "$SELF_UPDATED" = "1" ] && [ -f "$SELF_COPY" ]; then
+			info "用新版管理脚本继续更新…"
+			MIYU_REEXEC=1; export MIYU_REEXEC
+			exec /bin/sh "$SELF_COPY" update
+		fi
+	else
+		setup_self
+	fi
 	do_update_main
 }
 
@@ -1283,7 +1354,10 @@ do_update_main() {
 	if [ "$MODE" = "tunnel" ]; then
 		if [ -f "$CF_MARK_BIN" ] && [ -x "$CF_BIN" ]; then
 			if [ -n "$MIYU_CF_UPDATE" ]; then REPLY="$MIYU_CF_UPDATE"
-			else ask "要不要顺便把 cloudflared 也更新到最新官方版本？[Y/n]（直接回车 = 更新）："; fi
+			else
+				echo "  cloudflared 是负责连 Cloudflare 的小程序，新版一般更稳定，建议更新（同样会核对官方校验值）。"
+				ask "要不要顺便把 cloudflared 也更新到最新官方版本？[Y/n]（直接回车 = 更新，输入 n = 不更新）："
+			fi
 			case "$REPLY" in n|N|no|NO|0) info "cloudflared 保持不变。" ;; *) update_cloudflared ;; esac
 		else
 			info "cloudflared 不是本脚本装的，不帮你更新它（请用你原来的方式更新）。"
@@ -1293,13 +1367,13 @@ do_update_main() {
 		cf_wait_ready || true
 	fi
 	if [ -z "$(env_get MIYU_HOST)" ]; then
-		warn "还没有设置聊天网址（MIYU_HOST）。建议运行 sh install.sh config 填上你的聊天域名，多一层防护。"
+		warn "还没有设置聊天网址（MIYU_HOST）。建议运行 $CMD_NAME config 填上你的聊天域名，多一层防护。"
 	fi
 	NEW_VER="$("$BIN" -version 2>/dev/null || true)"
 	if [ "$OLD_VER" != "$NEW_VER" ]; then
 		warn "程序版本变了（${OLD_VER:-旧版} → $NEW_VER）：请让大家刷新一下聊天网页，旧页面可能登录不上（会提示刷新）。"
 	fi
-	info "想切换直连/Tunnel 模式、改网址、邀请码或上限：sh install.sh config"
+	info "想切换直连/Tunnel 模式、改网址、邀请码或上限：$CMD_NAME config"
 }
 
 # ---------- 查看状态 ----------
@@ -1312,9 +1386,11 @@ do_status() {
 	else
 		info "已安装：直连模式，内部端口 $PORT，外部端口 $EXT_PORT"
 	fi
+	if [ -f "$SELF_COPY" ]; then info "管理命令：$CMD_NAME（脚本版本 v$(script_ver "$SELF_COPY")）"
+	else warn "还没有 miyu 管理命令：运行一次 README 里的一键命令（末尾加 update）就会装上。"; fi
 	echo "  ---- 聊天程序（$APP） ----"
 	if [ "$INIT" = "systemd" ]; then systemctl --no-pager status $APP | head -n 5 || true; else rc-service $APP status || true; fi
-	if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then info "聊天服务运行正常。"; else err "聊天服务没响应，试试 sh install.sh update 或看日志。"; fi
+	if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then info "聊天服务运行正常。"; else err "聊天服务没响应，试试 $CMD_NAME update 或看日志。"; fi
 	h="$(env_get MIYU_HOST)"
 	info "聊天网址（MIYU_HOST）：${h:-没有设置（以浏览器访问的网址为准）}"
 	if [ -n "$(env_get MIYU_INVITE_CODE)" ]; then info "邀请码：已设置"; else info "邀请码：没有设置"; fi
@@ -1332,11 +1408,15 @@ do_status() {
 # ---------- 卸载 ----------
 # 删得干干净净：服务、程序、配置、聊天数据、运行用户、邀请码设置，以及安装时脚本自己加的那条防火墙规则；
 # Tunnel 模式还会删 cloudflared 服务、令牌文件，以及本脚本装的 cloudflared 程序和 miyu-cf 用户。
+# 还会删掉 miyu 管理命令和保存的脚本 /usr/local/lib/miyu-chat/（别的软件的同名命令不碰）。
 # 不会卸载你的防火墙软件，也不会删你原来就有的规则和你自己装的 cloudflared。curl 等常用工具保留。
 do_uninstall() {
 	need_root; detect_os
 	if [ "$MIYU_YES" = "1" ]; then REPLY="yes"
-	else ask "卸载会删除程序、服务和【全部聊天数据】，无法恢复。确定吗？输入 yes 继续："; fi
+	else
+		echo "  想留着聊天记录的话，先按 Ctrl+C 退出，把 $DATA_DIR 目录备份出来（方法见 README 常见问题）。"
+		ask "卸载会删除程序、服务、miyu 命令和【全部聊天数据】，无法恢复。确定吗？输入 yes 继续（直接回车 = 取消）："
+	fi
 	[ "$REPLY" = "yes" ] || { info "已取消卸载。"; exit 0; }
 	PORT=""; FW=""
 	if [ -f "$CONF" ]; then load_conf; fi
@@ -1362,20 +1442,201 @@ do_uninstall() {
 		if [ "$OS" = "alpine" ]; then deluser "$RUN_USER" 2>/dev/null || true; delgroup "$RUN_USER" 2>/dev/null || true
 		else userdel "$RUN_USER" 2>/dev/null || true; fi
 	fi
-	info "卸载完成，所有文件都已删除。"
+	# miyu 管理命令和保存的脚本（只删本脚本装的）
+	remove_self
+	info "卸载完成，所有文件都已删除（包括 miyu 管理命令）。想再装的话，重新运行 README 里的一键命令即可。"
+}
+
+# =====================================================================
+#  miyu 管理命令
+#  /usr/local/bin/miyu 只是一个几行的小文件，内容是“去运行 /usr/local/lib/miyu-chat/install.sh”。
+#  这样不管你在哪个目录、/tmp 有没有被清空，输入 miyu 都能管理聊天服务。
+# =====================================================================
+
+# 读出一个脚本文件里写的版本号（SCRIPT_VER="1.2.3" 里的 1.2.3）；v1.1.0 及更早的脚本没有这一行，读出来是空的
+script_ver() {
+	sed -n 's/^SCRIPT_VER="\([0-9.]*\)".*/\1/p' "$1" 2>/dev/null | head -n1
+}
+
+# 比较两个版本号：ver_gt 1.2.0 1.1.9 成立（返回 0），相等或更小返回 1
+ver_gt() {
+	awk -v a="$1" -v b="$2" 'BEGIN {
+		n = split(a, x, "."); m = split(b, y, "."); k = (n > m) ? n : m
+		for (i = 1; i <= k; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+		exit 1 }'
+}
+
+# 检查一个文件是不是完好的、新版的本脚本：
+#   第一行是 #!/bin/sh、写着本仓库名、有版本号（说明支持 miyu 命令），并且用 sh -n 检查没有语法错误
+#   （下载到一半断了、下到报错网页，都过不了这一关）
+script_ok() {
+	[ -f "$1" ] && [ -s "$1" ] || return 1
+	head -c 9 "$1" | grep -q '^#!/bin/sh' || return 1
+	grep -q "^REPO=\"$REPO\"" "$1" || return 1
+	[ -n "$(script_ver "$1")" ] || return 1
+	sh -n "$1" 2>/dev/null
+}
+
+# 从 GitHub 下载最新的安装脚本到 $1，连不上就换 jsDelivr；下载后用 script_ok 检查，不合格的直接丢掉
+fetch_latest_script() {
+	if [ -n "$MIYU_SCRIPT_URL" ]; then set -- "$1" "$MIYU_SCRIPT_URL"
+	else set -- "$1" "https://raw.githubusercontent.com/$REPO/main/install.sh?cb=$(date +%s)" "https://cdn.jsdelivr.net/gh/$REPO@main/install.sh"; fi
+	_dst="$1"; shift
+	for _u in "$@"; do
+		rm -f "$_dst"
+		if curl -fsSL --retry 2 --connect-timeout 15 --max-time 60 -o "$_dst" "$_u" 2>/dev/null && script_ok "$_dst"; then return 0; fi
+	done
+	rm -f "$_dst"
+	return 1
+}
+
+# 判断一个命令文件是不是本脚本装的（文件里有记号）。符号链接和别的软件的文件一律不算。
+is_our_cmd() {
+	[ -f "$1" ] && [ ! -L "$1" ] && grep -q "$CMD_MARK" "$1" 2>/dev/null
+}
+
+# 根据机器上已有的文件决定提示里写 miyu 还是 miyu-chat-ctl
+detect_cmd_name() {
+	if is_our_cmd "$CMD"; then CMD_NAME="miyu"
+	elif is_our_cmd "$CMD_ALT"; then CMD_NAME="miyu-chat-ctl"
+	elif [ -e "$CMD" ] || [ -L "$CMD" ]; then CMD_NAME="miyu-chat-ctl"
+	else CMD_NAME="miyu"; fi
+}
+
+# 把一份检查过的脚本保存到 /usr/local/lib/miyu-chat/install.sh（root 所有，0755）。
+# 先写到 .new 临时文件再一次性改名替换，替换过程中就算断电，也不会留下半截文件；正在运行的旧脚本也不受影响。
+store_script() {
+	mkdir -p "$SELF_DIR"
+	chown root:root "$SELF_DIR" 2>/dev/null || true
+	chmod 755 "$SELF_DIR"
+	cp "$1" "$SELF_COPY.new"
+	chown root:root "$SELF_COPY.new" 2>/dev/null || true
+	chmod 755 "$SELF_COPY.new"
+	mv -f "$SELF_COPY.new" "$SELF_COPY"
+}
+
+# 写 miyu 命令文件。/usr/local/bin/miyu 已经被别的软件占用时绝不覆盖，改用 miyu-chat-ctl；两个都被占用就只提示用法。
+install_cmd() {
+	cmd_path=""
+	for c in "$CMD" "$CMD_ALT"; do
+		if is_our_cmd "$c" || { [ ! -e "$c" ] && [ ! -L "$c" ]; }; then cmd_path="$c"; break; fi
+		# 第一次发现时提醒一下；以后已经改用备用名字了就不再重复唠叨
+		if [ "$c" != "$CMD" ] || ! is_our_cmd "$CMD_ALT"; then warn "$c 已经存在，而且不是本脚本装的，不覆盖它。"; fi
+	done
+	CMD_CHANGED=0
+	if [ -z "$cmd_path" ]; then
+		CMD_NAME="sh $SELF_COPY"
+		warn "没法安装管理命令。以后请用：sh $SELF_COPY config / update / status / uninstall"
+		return 0
+	fi
+	mkdir -p "${cmd_path%/*}"
+	cat > "$cmd_path.new" <<WRAP
+#!/bin/sh
+# $CMD_MARK（这一行是记号：更新、卸载时靠它认出这是密语安装脚本装的命令，请不要删）
+# 密语 miyu-chat 管理命令。直接输入 ${cmd_path##*/} 打开菜单（修改设置 / 更新 / 状态 / 卸载），
+# 也可以输入 ${cmd_path##*/} config、${cmd_path##*/} update、${cmd_path##*/} status、${cmd_path##*/} uninstall。
+# 它只是去运行保存好的安装脚本 $SELF_COPY；${cmd_path##*/} update 会顺便把那份脚本换成最新版。
+if [ ! -f $SELF_COPY ]; then
+	echo "找不到 $SELF_COPY，请重新运行 README 里的一键安装命令（末尾加 update）把它装回来。" >&2
+	exit 1
+fi
+exec /bin/sh $SELF_COPY "\$@"
+WRAP
+	CMD_NAME="${cmd_path##*/}"
+	# 内容和原来一模一样就不用换（CMD_CHANGED=0，安装提示也就不重复显示了）
+	if [ -f "$cmd_path" ] && cmp -s "$cmd_path.new" "$cmd_path"; then
+		rm -f "$cmd_path.new"; CMD_CHANGED=0
+	else
+		chown root:root "$cmd_path.new" 2>/dev/null || true
+		chmod 755 "$cmd_path.new"
+		mv -f "$cmd_path.new" "$cmd_path"
+		CMD_CHANGED=1
+	fi
+	# 以前因为 miyu 被占用而用了 miyu-chat-ctl，现在 miyu 能用了：删掉旧的备用命令，免得有两个
+	if [ "$cmd_path" = "$CMD" ] && is_our_cmd "$CMD_ALT"; then rm -f "$CMD_ALT"; fi
+	if [ "$CMD_CHANGED" = "1" ] && [ "$CMD_NAME" != "miyu" ]; then warn "管理命令装成了：$CMD_NAME（因为 miyu 这个名字已经被别的软件占用）。下面提示里的 miyu 都换成 $CMD_NAME。"; fi
+}
+
+# 安装、改设置、打开菜单时调用：把正在运行的这份脚本保存起来，再装好 miyu 命令。
+#   正在用 miyu 运行（就是保存的那份）：不用再复制，只检查命令文件；
+#   保存的那份比正在运行的还新：不降级，留着新的；
+#   没有脚本文件（比如用 curl | sh 运行）：去 GitHub 下载一份最新的。
+setup_self() {
+	src=""; tmp_s=""
+	if [ "$0" = "$SELF_COPY" ]; then
+		:
+	elif script_ok "$0"; then
+		if [ -f "$SELF_COPY" ] && ver_gt "$(script_ver "$SELF_COPY")" "$SCRIPT_VER"; then :; else src="$0"; fi
+	elif [ ! -f "$SELF_COPY" ]; then
+		tmp_s="$(mktemp)"
+		if fetch_latest_script "$tmp_s"; then src="$tmp_s"; fi
+	fi
+	if [ -n "$src" ]; then store_script "$src"; fi
+	[ -z "$tmp_s" ] || rm -f "$tmp_s"
+	if [ -f "$SELF_COPY" ]; then
+		install_cmd
+		[ "$CMD_CHANGED" = "1" ] || return 0
+		info "管理命令已就绪：以后在任何目录输入 $CMD_NAME 就能管理（修改设置 / 更新 / 状态 / 卸载）。"
+	else
+		CMD_NAME="sh install.sh"
+		warn "没能保存管理脚本（下载失败），这次先不装 miyu 命令；以后运行 README 里的一键命令（末尾加 update）会再装。"
+	fi
+}
+
+# miyu update 时调用：下载最新脚本，检查通过就替换保存的那份。结果：SELF_UPDATED=1 表示换成了更新的版本。
+# 下载到的版本比现在的还旧（多半是 jsDelivr 缓存还没更新）就不换，免得把新脚本换回旧的。
+refresh_self() {
+	SELF_UPDATED=0
+	tmp_s="$(mktemp)"
+	info "正在检查管理脚本（$CMD_NAME 命令）有没有新版本…"
+	if fetch_latest_script "$tmp_s"; then
+		nv="$(script_ver "$tmp_s")"
+		if ver_gt "$SCRIPT_VER" "$nv"; then
+			rm -f "$tmp_s"
+			warn "下载到的脚本（v$nv）比现在这份（v$SCRIPT_VER）还旧，可能是镜像缓存没更新，先不换。"
+			setup_self
+			return 0
+		fi
+		store_script "$tmp_s"
+		rm -f "$tmp_s"
+		if ver_gt "$nv" "$SCRIPT_VER"; then SELF_UPDATED=1; info "管理脚本已更新：v$SCRIPT_VER → v$nv（检查通过）"
+		else info "管理脚本已经是最新版 v$nv。"; fi
+		install_cmd
+	else
+		rm -f "$tmp_s"
+		warn "没下载到最新的管理脚本（连不上 GitHub 和 jsDelivr，或者下载的文件不完整），先继续用现在这份。"
+		setup_self
+	fi
+}
+
+# 卸载时调用：删掉 miyu 命令（只删带记号的，也就是本脚本装的）和保存的脚本
+remove_self() {
+	for c in "$CMD" "$CMD_ALT"; do
+		if is_our_cmd "$c"; then rm -f "$c"; fi
+		rm -f "$c.new"
+	done
+	rm -f "$SELF_COPY" "$SELF_COPY.new"
+	rmdir "$SELF_DIR" 2>/dev/null || true
+}
+
+usage() {
+	echo "用法：miyu [config|update|status|uninstall]        不带参数 = 打开菜单（已安装时）"
+	echo "      直接运行脚本文件时：sh install.sh [install|config|update|status|uninstall]"
 }
 
 # ---------- 入口 ----------
 # 所有代码都包在函数里，最后一行才真正开始执行：
 # 这样用 curl | sh 时就算网络中断只下载了一半，也不会执行半截脚本。
 main() {
+	detect_cmd_name
 	case "${1:-install}" in
 		install) do_install ;;
 		config|reconfigure|setup) do_config ;;
 		uninstall|remove) do_uninstall ;;
 		update|upgrade) do_update ;;
 		status) do_status ;;
-		*) echo "用法：sh install.sh [install|config|uninstall|update|status]"; exit 1 ;;
+		help|-h|--help) usage ;;
+		*) usage; exit 1 ;;
 	esac
 }
 
