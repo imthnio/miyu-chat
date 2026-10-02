@@ -17,6 +17,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -26,6 +27,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -39,7 +41,14 @@ var webFS embed.FS
 const (
 	maxCipherLen = 96 * 1024 // base64 密文上限
 	historyPage  = 50
+	// 防止被人开一大堆连接把小鸡拖垮：全站最多同时这么多条连接，同一个身份最多开这么多个页面
+	maxConns      = 2000
+	maxConnsPerID = 20
+	authTimeout   = 15 * time.Second // 连上后这么久还没登录就断开
+	idleTimeout   = 90 * time.Second // 登录后这么久没任何动静就断开
 )
+
+var connCount atomic.Int64
 
 var db *sql.DB
 
@@ -188,6 +197,12 @@ func (h *hub) remove(c *client) {
 	}
 }
 
+func (h *hub) count(pub string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.conns[pub])
+}
+
 func (h *hub) online(pub string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -247,6 +262,12 @@ func validHex(s string, n int) bool {
 	return err == nil
 }
 
+// validB64 检查是不是标准 base64，并且解出来的字节数在 [min, max] 范围内
+func validB64(s string, min, max int) bool {
+	b, err := base64.StdEncoding.DecodeString(s)
+	return err == nil && len(b) >= min && len(b) <= max
+}
+
 func verify(pubHex, msg, sigHex string) bool {
 	pub, err1 := hex.DecodeString(pubHex)
 	sig, err2 := hex.DecodeString(sigHex)
@@ -274,6 +295,12 @@ type inMsg struct {
 }
 
 func serveWS(w http.ResponseWriter, r *http.Request) {
+	if connCount.Add(1) > maxConns {
+		connCount.Add(-1)
+		http.Error(w, "服务器连接数已满，请稍后再试", http.StatusServiceUnavailable)
+		return
+	}
+	defer connCount.Add(-1)
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -320,8 +347,14 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 	}()
 
-	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-	conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(90 * time.Second)); return nil })
+	// 没登录的连接只给 authTimeout 时间，登录后才按 idleTimeout 续期（心跳回应也只在登录后续期）
+	conn.SetReadDeadline(time.Now().Add(authTimeout))
+	conn.SetPongHandler(func(string) error {
+		if c.pub != "" {
+			conn.SetReadDeadline(time.Now().Add(idleTimeout))
+		}
+		return nil
+	})
 
 	// 登录挑战
 	nb := make([]byte, 32)
@@ -334,13 +367,17 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-		var m inMsg
-		if json.Unmarshal(data, &m) != nil {
-			continue
+		if c.pub != "" {
+			conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		}
+		// 先限流再解析：乱发的垃圾数据也要算次数，免得白白消耗 CPU
 		if !c.allow() {
 			c.fail("操作太频繁，请稍后再试")
+			continue
+		}
+		var m inMsg
+		if json.Unmarshal(data, &m) != nil {
+			c.fail("数据格式错误")
 			continue
 		}
 		if c.pub == "" {
@@ -348,10 +385,15 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 				c.fail("请先登录")
 				continue
 			}
+			m.Pub, m.Box = strings.ToLower(m.Pub), strings.ToLower(m.Box) // 统一小写，避免同一把钥匙变成两个用户
 			if !validHex(m.Pub, 32) || !validHex(m.Box, 32) ||
 				!verify(m.Pub, "miyu-login:"+nonce, m.Sig) ||
 				!verify(m.Pub, "miyu-box:"+m.Box, m.BoxSig) {
 				c.fail("密钥校验失败")
+				return
+			}
+			if h.count(m.Pub) >= maxConnsPerID {
+				c.fail("同一个身份打开的页面太多了，请关掉一些再试")
 				return
 			}
 			t := now()
@@ -490,7 +532,9 @@ func (c *client) handle(m *inMsg) {
 			c.fail("对方不是你的好友")
 			return
 		}
-		if len(m.CT) == 0 || len(m.CT) > maxCipherLen || len(m.Nonce) == 0 || len(m.Nonce) > 64 || len(m.CID) > 64 {
+		// 密文和 nonce 必须是合法 base64：nonce 正好 24 字节，密文至少 16 字节（加密自带的校验码）
+		if len(m.CT) == 0 || len(m.CT) > maxCipherLen || !validB64(m.CT, 16, maxCipherLen) ||
+			!validB64(m.Nonce, 24, 24) || len(m.CID) > 64 {
 			c.fail("消息太长或格式错误")
 			return
 		}
