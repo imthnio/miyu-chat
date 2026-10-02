@@ -21,6 +21,7 @@
   // ---------- 状态 ----------
   let keys = null;        // {seed, sign, box, id}
   let ws = null, wsOk = false, retry = 0;
+  let stopped = false;    // 遇到“重连也没用”的错误（比如密钥校验失败）时设为 true，不再自动重连
   let me = null;
   const friends = new Map();   // id -> {id,name,box,boxsig,online,verified,shared,unread}
   const requests = new Map();  // id -> user
@@ -89,6 +90,7 @@
 
   function start(seed) {
     keys = deriveKeys(seed);
+    stopped = false; retry = 0;
     $("loginErr").textContent = "";
     $("login").classList.add("hidden");
     $("app").classList.remove("hidden");
@@ -115,6 +117,7 @@
     ws = new WebSocket(proto + location.host + "/ws");
     ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; } handle(m); };
     ws.onclose = () => {
+      if (stopped) return;
       setConn(false, "已断开，正在重连…");
       const wait = Math.min(15000, 1000 * 2 ** retry++);
       setTimeout(connect, wait);
@@ -124,8 +127,11 @@
   function handle(m) {
     switch (m.t) {
       case "challenge": {
-        // 用私钥对服务器给的随机数签名，证明我拥有这个 ID
-        const sig = nacl.sign.detached(enc.encode("miyu-login:" + m.nonce), keys.sign.secretKey);
+        // 用私钥对服务器给的随机数签名，证明我拥有这个 ID。
+        // 签名里带上地址栏里的网址（location.host），这样别的网站就算转发了这串随机数，
+        // 签出来的也是那个网站的网址，拿到真正的服务器上验证不通过，没法冒充我登录。
+        const sig = nacl.sign.detached(enc.encode("miyu-login:v2:" + location.host + ":" + m.nonce), keys.sign.secretKey);
+
         const boxHex = toHex(keys.box.publicKey);
         const boxsig = nacl.sign.detached(enc.encode("miyu-box:" + boxHex), keys.sign.secretKey);
         ws.send(JSON.stringify({ t: "auth", pub: keys.id, box: boxHex, boxsig: toHex(boxsig), sig: toHex(sig) }));
@@ -143,7 +149,10 @@
         if (active && friends.has(active)) openChat(active); else if (active) closeChat();
         break;
       case "me": me = m.me; toast("昵称已保存"); break;
-      case "error": toast(m.msg); break;
+      case "error":
+        // 登录类错误重连也没用：回到登录页把原因写清楚，等用户处理后再点登录
+        if (FATAL_CODES.has(m.code)) { backToLogin(m.msg, m.code); break; }
+        toast(m.msg); break;
       case "req_sent": toast("好友申请已发送，等对方通过"); $("addInput").value = ""; break;
       case "request": requests.set(m.user.id, m.user); renderSide(); toast("收到新的好友申请"); break;
       case "request_gone": requests.delete(m.id); renderSide(); break;
@@ -175,7 +184,19 @@
     }
   }
 
+  // 这些错误码表示“登录不了”，自动重连只会一直失败，所以停下来回到登录页
+  const FATAL_CODES = new Set(["bad_auth"]);
+  function backToLogin(msg, code) {
+    stopped = true;
+    if (ws) ws.close();
+    setConn(false, "未登录");
+    $("app").classList.add("hidden");
+    $("login").classList.remove("hidden");
+    $("loginErr").textContent = msg || "登录失败，请重试";
+  }
+
   // ---------- 侧边栏 ----------
+
   $("saveName").onclick = () => send({ t: "setname", name: $("myName").value });
   $("copyId").onclick = () => copy(keys.id);
   $("addBtn").onclick = () => {

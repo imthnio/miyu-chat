@@ -4,6 +4,8 @@
 //
 //	端到端加密：消息在你的浏览器里加密，只有聊天对方的浏览器能解开。服务器只负责转发和保存“看不懂的密文”。
 //	密钥登录：没有账号密码。每个人有一把私钥，服务器发一串随机数，浏览器用私钥签名，签名对了就算登录成功。
+//	域名绑定：登录签名里带上浏览器地址栏里的网址（域名[:端口]）。别的服务器就算把我们的随机数转给你签名，
+//	          签出来的也是“它自己的网址”，拿到我们这里验证不通过，没法冒充你登录。
 //	ID / 公钥：由私钥算出来，可以公开，发给朋友加好友用。
 //	双删：任意一方删除消息，服务器会把密文彻底删掉，并通知双方浏览器立刻清掉这条消息。
 //	WebSocket：浏览器和服务器之间一直保持的连接，新消息能马上推过来，不用一直刷新页面。
@@ -50,6 +52,10 @@ const (
 )
 
 var connCount atomic.Int64
+
+// allowedHosts 是 -host / MIYU_HOST 设置的“允许的网址”列表（小写，可以有多个）。
+// 为空时就用这次请求里的 Host（也就是浏览器访问的网址）。
+var allowedHosts []string
 
 var db *sql.DB
 
@@ -269,6 +275,37 @@ func validB64(s string, min, max int) bool {
 	return err == nil && len(b) >= min && len(b) <= max
 }
 
+// parseHosts 把 "chat.example.com, 1.2.3.4:8080" 这样逗号分隔的写法拆成小写列表，空的去掉
+func parseHosts(s string) []string {
+	out := []string{}
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.ToLower(strings.TrimSpace(p)); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// loginHosts 返回这次登录允许出现在签名里的网址。
+// 设置了 MIYU_HOST 就只认它（最安全）；没设置就认浏览器访问时带来的 Host。
+func loginHosts(r *http.Request) []string {
+	if len(allowedHosts) > 0 {
+		return allowedHosts
+	}
+	return []string{strings.ToLower(r.Host)}
+}
+
+// verifyLogin 检查登录签名：签的内容必须是 "miyu-login:v2:" + 网址 + ":" + 随机数，网址必须是我们允许的。
+// 旧版（v1）只签 "miyu-login:" + 随机数，这里不再接受，所以旧版网页需要刷新到新版才能登录。
+func verifyLogin(pub, nonce, sig string, hosts []string) bool {
+	for _, host := range hosts {
+		if verify(pub, "miyu-login:v2:"+host+":"+nonce, sig) {
+			return true
+		}
+	}
+	return false
+}
+
 func verify(pubHex, msg, sigHex string) bool {
 	pub, err1 := hex.DecodeString(pubHex)
 	sig, err2 := hex.DecodeString(sigHex)
@@ -377,6 +414,7 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 	nb := make([]byte, 32)
 	rand.Read(nb)
 	nonce := hex.EncodeToString(nb)
+	hosts := loginHosts(r)
 	c.reply(map[string]any{"t": "challenge", "nonce": nonce})
 
 	for {
@@ -404,9 +442,10 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 			}
 			m.Pub, m.Box = strings.ToLower(m.Pub), strings.ToLower(m.Box) // 统一小写，避免同一把钥匙变成两个用户
 			if !validHex(m.Pub, 32) || !validHex(m.Box, 32) ||
-				!verify(m.Pub, "miyu-login:"+nonce, m.Sig) ||
+				!verifyLogin(m.Pub, nonce, m.Sig, hosts) ||
 				!verify(m.Pub, "miyu-box:"+m.Box, m.BoxSig) {
-				c.fail("密钥校验失败")
+				c.reply(map[string]any{"t": "error", "code": "bad_auth",
+					"msg": "密钥校验失败：请刷新网页换到最新版再登录；如果还不行，请让管理员确认 MIYU_HOST 和你访问的网址一致"})
 				return
 			}
 			if h.count(m.Pub) >= maxConnsPerID {
@@ -624,11 +663,18 @@ func (c *client) makeFriends(other string) {
 func main() {
 	addr := flag.String("listen", envOr("MIYU_LISTEN", ":8080"), "监听地址，例如 :8080")
 	dbPath := flag.String("db", envOr("MIYU_DB", "miyu.db"), "SQLite 数据库文件")
+	hostList := flag.String("host", envOr("MIYU_HOST", ""), "允许登录的网址（域名[:端口]），多个用逗号分隔，例如 chat.example.com；不填就用浏览器访问的网址")
 	showVer := flag.Bool("version", false, "显示版本号后退出")
 	flag.Parse()
 	if *showVer {
 		println("miyu-chat " + version)
 		return
+	}
+	allowedHosts = parseHosts(*hostList)
+	if len(allowedHosts) == 0 {
+		log.Printf("提示：没有设置 MIYU_HOST，登录时以浏览器访问的网址为准。建议设置成你的聊天域名（例如 MIYU_HOST=chat.example.com），防止别的网站转发登录")
+	} else {
+		log.Printf("登录只认这些网址：%s", strings.Join(allowedHosts, ", "))
 	}
 
 	openDB(*dbPath)
